@@ -1,0 +1,17 @@
+[package]
+name = "gen-trade-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[lib]
+name = "gen_trade_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "=0.26.0", features = ["extension-module"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
