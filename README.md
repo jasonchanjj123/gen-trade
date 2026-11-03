@@ -14,13 +14,22 @@ Read [the source mapping, equations, and adaptation notes](docs/PAPER_METHODS.md
 before using either method. The papers use different fees and different return
 statistics; their scores must not be compared as ordinary annualized Sharpe.
 
-## Run in the prepared cloud environment
+## Complete development environment
+
+The repository includes the full research environment: Python 3.12.14,
+Freqtrade/DEAP/Optuna, statistics and plotting tools, Polars/Arrow/DuckDB,
+Rust 1.90.0 with tested PyO3/Rayon integration, and PostgreSQL 17 / Redis 7.4
+service configuration. See [environment setup](docs/ENVIRONMENT.md) for prerequisites,
+version pins, persistent storage, and verification details.
 
 ```bash
-cd /workspace/gen-trade
-source /workspace/shared/gen-trade-environment/activate.sh
+cd gen-trade
+bash scripts/setup-environment.sh
+source scripts/activate.sh
+bash scripts/services.sh up -d --wait --wait-timeout 60
+python environment/verify.py --services
 gen-trade demo --cross-market-features --output reports/synthetic-comparison.json
-pytest tests/ -q
+GEN_TRADE_TEST_SERVICES=1 pytest tests/ -q
 ```
 
 The demo generates invented BTC, gold, and FX OHLCV. Its JSON report records
@@ -28,12 +37,14 @@ training-only selections, held-out fold statistics, paired dependent-data
 inference, a next-open buy-and-hold baseline, costs, seeds, source/data hashes,
 and limitations. **Synthetic results validate software, not profitability.**
 
-## Install from the project lock
+## Core-only installation
 
-Python 3.12 and `uv` are required. The optional native build requires Rust 1.90.
+For a smaller installation without the complete research tools, Python 3.12 and
+`uv` are required. The optional native build requires Rust 1.90. Use the setup
+script above to install and verify the full stack, including the Rayon probe.
 
 ```bash
-uv sync --locked --all-extras
+uv sync --locked --extra dev --extra storage
 uv run --no-sync pytest tests/ -q
 # Optional native backend; run maturin from native/ to use its own metadata.
 cd native
@@ -90,8 +101,8 @@ separate research work, as does multi-asset portfolio execution.
 ## Database and cache
 
 ```bash
-bash /workspace/shared/gen-trade-environment/start-services.sh
-source /workspace/shared/gen-trade-environment/activate.sh
+bash scripts/services.sh up -d --wait --wait-timeout 60
+source scripts/activate.sh
 GEN_TRADE_TEST_SERVICES=1 pytest tests/test_storage.py -q
 gen-trade demo --persist --experiment-id demo-001 --output reports/demo-001.json
 ```

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gen-trade"
 version = "0.1.0"
 description = "Causal research implementations of two directional-change evolutionary trading methods"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy>=2", "pandas>=2.2", "scipy>=1.14", "statsmodels>=0.14",
     "arch>=7", "deap>=1.4", "TA-Lib>=0.6", "pyarrow>=18",
@@ -15,6 +15,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "hypothesis>=6", "maturin>=1.9"]
 storage = ["psycopg[binary,pool]>=3.2", "redis>=5"]
+research = [
+    "freqtrade==2026.10", "optuna>=3.5", "polars>=1", "duckdb>=1",
+    "numba>=0.59", "scikit-learn>=1.5", "sqlalchemy>=2", "pydantic>=2",
+    "pandera>=0.20", "matplotlib>=3.8", "seaborn>=0.13", "plotly>=5",
+    "jupyterlab>=4", "python-dotenv>=1", "loguru>=0.7",
+    "beautifulsoup4>=4.12", "requests>=2.31", "pytest-benchmark>=4",
+    "black>=24", "flake8>=7",
+]
 
 [project.scripts]
 gen-trade = "gen_trade.cli:main"

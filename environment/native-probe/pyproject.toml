@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "gen-trade-env-native"
+version = "0.1.0"
+description = "Readiness probe for PyO3 and Rayon, not a trading kernel"
+requires-python = ">=3.12"
+
+[tool.maturin]
+module-name = "gen_trade_env_native"

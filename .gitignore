@@ -7,6 +7,10 @@ build/
 dist/
 .venv/
 native/target/
+environment/native-probe/target/
+.tools/
+.env
 *.so
 reports/
 data/
+.benchmarks/
