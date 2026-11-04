@@ -290,3 +290,177 @@ def holm_adjust(pvalues: Iterable[float | None]) -> list[float | None]:
         running = max(running, (len(ordered) - rank) * value)
         adjusted[index] = min(1.0, running)
     return adjusted
+
+
+# ---------------------------------------------------------------------------
+# EXTENSIONS (audit item 3 and selection-bias reporting; docs/EXTENSIONS.md).
+# None of these corrects the adaptive genetic search itself; they make the
+# held-out comparison less confounded and quantify selection effects.
+
+EULER_GAMMA = 0.5772156649015329
+
+
+def exposure_path(result: BacktestResult) -> np.ndarray:
+    """Capital-weighted fraction invested in each equity period.
+
+    Period t is the equity step from mark t to mark t+1 (bar t). A position
+    entered at the open of bar e and exited at the open of bar x is counted as
+    invested in periods e..x-1; a sample-end liquidation at the final close is
+    invested through its exit bar. Portfolio sleeves add their allocation.
+    """
+    periods = len(np.asarray(result.equity)) - 1
+    exposure = np.zeros(max(periods, 0))
+    for trade in result.trades:
+        stop = trade.exit_index + 1 if trade.forced_at_end else trade.exit_index
+        exposure[max(trade.entry_index, 0):min(stop, periods)] += float(trade.allocation_fraction)
+    return np.clip(exposure, 0.0, 1.0)
+
+
+def _period_returns(result: BacktestResult) -> np.ndarray:
+    equity = np.asarray(result.equity, dtype=float)
+    return np.diff(equity) / equity[:-1]
+
+
+def alpha_beta(result: BacktestResult, benchmark: BacktestResult, *, periods_per_year: float) -> dict[str, Any]:
+    """OLS of strategy period returns on benchmark returns, HAC standard errors."""
+    y, x = _period_returns(result), _period_returns(benchmark)
+    if y.shape != x.shape:
+        raise ValueError("alpha/beta needs aligned periods")
+    output = {"alpha_per_period": None, "alpha_annualized": None, "beta": None,
+              "alpha_hac_pvalue": None, "r_squared": None, "note": None}
+    if y.size < 8 or _constant(x):
+        output["note"] = "Too few periods or constant benchmark; regression omitted."
+        return output
+    if _constant(y):
+        output.update(alpha_per_period=float(y[0]), beta=0.0, note="Constant strategy returns (cash).")
+        output["alpha_annualized"] = _finite(float(y[0]) * periods_per_year)
+        return output
+    maxlags = min(y.size - 1, max(1, int(np.floor(4 * (y.size / 100.0) ** (2 / 9)))))
+    fit = sm.OLS(y, sm.add_constant(x)).fit(cov_type="HAC", cov_kwds={"maxlags": maxlags}, use_t=False)
+    alpha, beta = float(fit.params[0]), float(fit.params[1])
+    output.update(alpha_per_period=_finite(alpha), alpha_annualized=_finite(alpha * periods_per_year),
+                  beta=_finite(beta), alpha_hac_pvalue=_finite(fit.pvalues[0]), r_squared=_finite(fit.rsquared))
+    return output
+
+
+def exposure_matched_blend(benchmark: BacktestResult, exposure: float) -> BacktestResult:
+    """Static mix of cash (zero return) and the benchmark at a given exposure."""
+    from gen_trade.backtest import BacktestResult as Result
+    returns = exposure * _period_returns(benchmark)
+    equity = float(benchmark.equity[0]) * np.concatenate([[1.0], np.cumprod(1.0 + returns)])
+    return Result(equity, np.asarray([]), (), benchmark.config, tuple(benchmark.timestamps))
+
+
+def random_interval_signals(trades, periods: int, reps: int, rng: np.random.Generator) -> np.ndarray | None:
+    """Signals that replay the same holding durations at random times.
+
+    Holding lengths (in bars) are shuffled and placed with random gaps, keeping
+    at least one flat bar between positions. Entry/exit signals are emitted one
+    bar early because decisions execute at the next open. Returns n-by-reps.
+    """
+    if not trades:
+        return None
+    durations = np.asarray([max(1, t.exit_index - t.entry_index) for t in trades], dtype=int)
+    count = len(durations)
+    # Entries start at bar >= 1; the last exit must be a signalled open <= n-1.
+    free = (periods - 2) - int(durations.sum()) - (count - 1)
+    if free < 0:
+        return None
+    signals = np.zeros((periods, reps), dtype=np.int8)
+    for rep in range(reps):
+        order = rng.permutation(durations)
+        cuts = np.sort(rng.integers(0, free + 1, size=count))
+        gaps = np.diff(np.concatenate([[0], cuts]))
+        position = 1
+        for gap, duration in zip(gaps, order):
+            entry = position + int(gap)
+            exit_ = entry + int(duration)
+            signals[entry - 1, rep] = 1
+            if exit_ - 1 < periods - 1:
+                signals[exit_ - 1, rep] = -1
+            position = exit_ + 1
+    return signals
+
+
+def probabilistic_sharpe_ratio(returns: np.ndarray, benchmark_sharpe: float = 0.0) -> float | None:
+    """PSR of Bailey and Lopez de Prado: P(true per-period SR > benchmark)."""
+    from scipy.stats import norm, skew, kurtosis
+    values = np.asarray(returns, dtype=float)
+    if values.size < 8 or _constant(values):
+        return None
+    sharpe = float(np.mean(values) / np.std(values, ddof=1))
+    gamma3, gamma4 = float(skew(values)), float(kurtosis(values, fisher=False))
+    variance = 1 - gamma3 * sharpe + (gamma4 - 1) / 4 * sharpe ** 2
+    if variance <= 0:
+        return None
+    return _finite(norm.cdf((sharpe - benchmark_sharpe) * np.sqrt(values.size - 1) / np.sqrt(variance)))
+
+
+def deflated_sharpe_ratio(returns: np.ndarray, trials: int, sharpe_variance: float) -> dict[str, Any]:
+    """Deflated Sharpe ratio (Bailey and Lopez de Prado 2014).
+
+    The benchmark SR0 is the expected maximum per-period Sharpe among ``trials``
+    independent unskilled trials whose Sharpe estimates have variance
+    ``sharpe_variance``; DSR is the PSR against that SR0.
+    """
+    from scipy.stats import norm
+    if type(trials) is not int or trials < 1 or not np.isfinite(sharpe_variance) or sharpe_variance < 0:
+        raise ValueError("DSR needs a positive integer trial count and a finite nonnegative Sharpe variance")
+    if trials == 1:
+        threshold = 0.0
+    else:
+        threshold = float(np.sqrt(sharpe_variance) * ((1 - EULER_GAMMA) * norm.ppf(1 - 1 / trials)
+                                                       + EULER_GAMMA * norm.ppf(1 - 1 / (trials * np.e))))
+    return {"deflated_sharpe_ratio": probabilistic_sharpe_ratio(returns, threshold),
+            "expected_max_null_sharpe_per_period": threshold, "trials": trials,
+            "trial_sharpe_variance": float(sharpe_variance)}
+
+
+def pbo_cscv(matrix: np.ndarray, blocks: int = 8) -> dict[str, Any]:
+    """Probability of backtest overfitting by CSCV (Bailey et al. 2017).
+
+    Columns are strategies, rows are aligned periods. For every half/half split
+    of ``blocks`` contiguous blocks, the in-sample best column (by Sharpe) is
+    ranked out of sample; PBO is the share of splits where that rank falls at or
+    below the out-of-sample median (logit <= 0).
+    """
+    from itertools import combinations
+    values = np.asarray(matrix, dtype=float)
+    if values.ndim != 2 or values.shape[1] < 2 or blocks < 2 or blocks % 2 or values.shape[0] < 2 * blocks:
+        raise ValueError("PBO needs >=2 strategies, an even block count and enough rows")
+    parts = np.array_split(np.arange(values.shape[0]), blocks)
+    def sharpe(rows):
+        sample = values[rows]
+        std = sample.std(axis=0, ddof=1)
+        return np.divide(sample.mean(axis=0), std, out=np.zeros(values.shape[1]), where=std > 0)
+    logits = []
+    for chosen in combinations(range(blocks), blocks // 2):
+        inside = np.concatenate([parts[i] for i in chosen])
+        outside = np.concatenate([parts[i] for i in range(blocks) if i not in chosen])
+        best = int(np.argmax(sharpe(inside)))
+        oos = sharpe(outside)
+        rank = (np.sum(oos < oos[best]) + 0.5 * (np.sum(oos == oos[best]) - 1) + 1) / (values.shape[1] + 1)
+        logits.append(float(np.log(rank / (1 - rank))))
+    logits = np.asarray(logits)
+    return {"pbo": float(np.mean(logits <= 0)), "splits": int(logits.size), "blocks": blocks,
+            "strategies": int(values.shape[1]), "median_logit": float(np.median(logits))}
+
+
+def spa_test(benchmark_returns: np.ndarray, model_returns: np.ndarray, *, block_size: float = 12,
+             reps: int = 1000, seed: int = 0) -> dict[str, Any]:
+    """Hansen (2005) SPA: H0 = no model beats the benchmark (losses = -returns)."""
+    from arch.bootstrap import SPA
+    benchmark = np.asarray(benchmark_returns, dtype=float)
+    models = np.asarray(model_returns, dtype=float)
+    if models.ndim == 1:
+        models = models[:, None]
+    if benchmark.shape[0] != models.shape[0] or benchmark.shape[0] < 8:
+        raise ValueError("SPA needs aligned benchmark/model periods")
+    if _constant(benchmark) and all(_constant(models[:, i]) for i in range(models.shape[1])):
+        return {"pvalue_consistent": None, "note": "All series constant."}
+    test = SPA(-benchmark, -models, block_size=int(max(1, round(block_size))), reps=reps, seed=seed)
+    test.compute()
+    values = test.pvalues
+    return {"pvalue_lower": _finite(values["lower"]), "pvalue_consistent": _finite(values["consistent"]),
+            "pvalue_upper": _finite(values["upper"]), "models": int(models.shape[1]), "reps": reps,
+            "null": "no model has lower expected loss (higher expected return) than the benchmark"}

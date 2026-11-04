@@ -170,6 +170,15 @@ code, execution, fold, and seed context. Cache failure means recompute. The
 optimizers currently use fit-local memoization; the Redis helper is available
 to an orchestration layer and is not silently enabled inside their fitness loops.
 
+## Theory and audit extensions
+
+Labeled, opt-in method variants and an audited benchmark protocol are documented
+in [docs/EXTENSIONS.md](docs/EXTENSIONS.md). Defaults stay paper-faithful:
+
+```bash
+gen-trade benchmark --protocol audited --method-profile improved --output reports/audited-improved
+```
+
 ## Statistical scope
 
 Reports include net equity returns, annualization under an explicit sampling
@@ -180,8 +189,10 @@ Nominal p-values are labeled unadjusted; Holm-adjusted HAC values cover the thre
 paired comparisons within each fold/seed. One run does not account for evolutionary
 selection, many strategy trials, many assets, or dependent folds. A Holm helper is
 provided, but does not replace a declared multiple-testing protocol. Deflated
-Sharpe, PBO, broad baseline replication and the papers' 50-seed experiments are
-not claimed. The stock/FX benchmark separately defines a suite of 54 paired tests
+Sharpe, PBO and Hansen SPA are reported in the benchmark summary over the
+retained method × seed paths (see [docs/EXTENSIONS.md](docs/EXTENSIONS.md)); they
+do not correct the genetic search inside each fit. Broad baseline replication and
+the papers' 50-seed experiments are not claimed. The stock/FX benchmark separately defines a suite of 54 paired tests
 across its six assets, three seeds and three method pairs, and applies Holm to
 that family. Its stress scenario reuses the same frozen strategies with doubled
 assumed costs; historical broker swap data are unavailable.

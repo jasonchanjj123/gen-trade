@@ -15,10 +15,60 @@ import pandas as pd
 from . import __version__
 from .backtest import ExecutionConfig, run_backtest
 from .data import ChromosomeContext, align_features, validate_bars
-from .experiments import METHOD_NAMES, ExperimentJob, candidates_for, run_experiment, run_experiment_or_cash
+from .experiments import (DEPLOY_POLICIES, METHOD_NAMES, ExperimentJob, NoEligibleConfiguration, candidates_for,
+                          finish_experiment, finish_or_cash, pooled_choice, run_experiment, run_experiment_or_cash,
+                          run_trials)
 from .parallel import process_pool
 from .instruments import InstrumentSpec
-from .statistics import detailed_statistics, holm_adjust, paired_comparison
+from .statistics import (alpha_beta, detailed_statistics, exposure_matched_blend, exposure_path, holm_adjust,
+                         paired_comparison, random_interval_signals)
+
+SELECTION_SCOPES = ("per_seed", "pooled")
+
+
+def exposure_controls(name, result, baseline, test, execution, *, periods_per_year, bootstrap_reps, seed,
+                      random_reps=200) -> dict:
+    """EXTENSION (audit item 3): separate timing skill from market exposure.
+
+    Reports the capital-weighted time in market, a HAC alpha/beta regression on
+    next-open buy-and-hold, paired tests against buy-and-hold and against a
+    static cash/buy-and-hold blend with the same mean exposure, and (for
+    single-position methods) the rank of the net return among random entry
+    times with the same holding durations and costs.
+    """
+    exposure = exposure_path(result)
+    mean_exposure = float(exposure.mean()) if exposure.size else 0.0
+    blend = exposure_matched_blend(baseline, mean_exposure)
+    controls = {"mean_exposure":mean_exposure,
+                "alpha_beta_vs_buy_and_hold":alpha_beta(result, baseline, periods_per_year=periods_per_year),
+                "minus_buy_and_hold":paired_comparison(result, baseline, periods_per_year=periods_per_year,
+                                                       bootstrap_reps=bootstrap_reps, seed=seed),
+                "minus_exposure_matched_blend":paired_comparison(result, blend, periods_per_year=periods_per_year,
+                                                                 bootstrap_reps=bootstrap_reps, seed=seed),
+                "exposure_matched_blend_net_return":float(blend.equity[-1]/blend.equity[0]-1),
+                "random_timing":None}
+    if name == "igtsp_ring":
+        controls["random_timing_note"] = "Not computed for multi-sleeve portfolios; use the exposure-matched blend."
+        return controls
+    rng = np.random.default_rng([seed, 7919])
+    signals = random_interval_signals(result.trades, len(test), random_reps, rng)
+    if signals is None:
+        controls["random_timing_note"] = "No trades (or no room to place them); random timing undefined."
+        return controls
+    plain = replace(execution, max_holding_days=None, take_profit=None, stop_loss=None)
+    if plain.instrument is not None:
+        from .market_execution import MarketArrays, execute_batch
+        outcome = execute_batch(MarketArrays.from_bars(test, plain.instrument), signals, plain)
+        random_returns = outcome.terminal_equity / plain.initial_cash - 1
+    else:
+        random_returns = np.array([run_backtest(test, signals[:, i], plain).total_return for i in range(random_reps)])
+    actual = float(result.total_return)
+    controls["random_timing"] = {"reps":random_reps, "method_net_return":actual,
+        "random_median_net_return":float(np.median(random_returns)),
+        "percentile":float(np.mean(random_returns <= actual)),
+        "one_sided_pvalue":float((1 + np.sum(random_returns >= actual)) / (random_reps + 1)),
+        "construction":"same holding durations and trade count, random placement, same costs; exits replayed exactly"}
+    return controls
 
 
 @dataclass(frozen=True)
@@ -94,6 +144,8 @@ def compare_methods(
     fold_plan: list[Fold] | None = None, include_paths: bool = False,
     stress_instrument: InstrumentSpec | None = None,
     on_no_eligible: str = 'raise',
+    selection: str = "per_seed", deploy: str = "refit", min_validation_trades: int = 1,
+    validation_curves: bool = False, exposure_controls_enabled: bool = False, random_timing_reps: int = 200,
 ) -> dict:
     """Compare documented adaptations; common costs/settings, frozen training fits.
 
@@ -107,6 +159,10 @@ def compare_methods(
             raise ValueError(f"{name} must be an integer >= {lower}")
     if on_no_eligible not in ('raise','cash'):
         raise ValueError('on_no_eligible must be raise or cash')
+    if selection not in SELECTION_SCOPES or deploy not in DEPLOY_POLICIES:
+        raise ValueError(f"selection must be one of {SELECTION_SCOPES}; deploy one of {DEPLOY_POLICIES}")
+    if type(min_validation_trades) is not int or min_validation_trades < 1:
+        raise ValueError("min_validation_trades must be a positive integer")
     if workers > 1 and island_workers > 1:
         raise ValueError("Use workers=1 for parallel islands; avoid nested experiment/island process pools")
     if not np.isfinite(periods_per_year) or periods_per_year <= 0:
@@ -184,6 +240,8 @@ def compare_methods(
                                     "backend":"spawn_processes" if workers > 1 or island_workers > 1 else "serial",
                                     "numerical_threads_per_process_worker":1},
                      "candidate_configurations":configs,
+                     "selection_scope":selection, "deploy":deploy, "min_validation_trades":min_validation_trades,
+                     "validation_curves":validation_curves, "exposure_controls":exposure_controls_enabled,
                      "budget_note":"Equal population/generations per fit; ring population is TOTAL across islands. Calibration, strategy-bank backtests, candidate counts and runtime differ.",
                      "comparison":"research adaptations; not numerical paper reproductions"},
         "folds":[],
@@ -217,16 +275,36 @@ def compare_methods(
                                     fold.test_start-fold.train_start, population_size, generations, fold_seed,
                                     executions[name],configs[name],island_workers,
                                     replace(executions[name],instrument=stress_instrument,slippage_bps=slippage_bps*2)
-                                    if stress_instrument else None)
+                                    if stress_instrument else None, deploy, min_validation_trades, validation_curves)
                 pending.append((record_index, name, job))
     pool = process_pool(min(workers, len(pending))) if workers > 1 else None
     run_job=run_experiment_or_cash if on_no_eligible=='cash' else run_experiment
     results_by_record = [{} for _ in records]
+    pooled = selection == "pooled" and validation_bars > 0
+
+    def call(function, *args):
+        return pool.submit(function, *args) if pool else function(*args)
+
+    def value(task):
+        return task.result() if pool else task
+
     try:
-        # Submit all independent method/fold/seed jobs before awaiting results.
-        tasks = [(index, name, pool.submit(run_job, job)) for index, name, job in pending] if pool else pending
+        if pooled:
+            # EXTENSION phase 1: training fits and validation scores for every seed.
+            trial_tasks = [(index, name, job, call(run_trials, job)) for index, name, job in pending]
+            trial_sets = [(index, name, job, value(task)) for index, name, job, task in trial_tasks]
+            groups = {}
+            for index, name, job, trials in trial_sets:
+                groups.setdefault((records[index][0]["index"], name), []).append(trials)
+            choices = {key:pooled_choice(sets) for key, sets in groups.items()}
+            finisher = finish_or_cash if on_no_eligible == 'cash' else finish_experiment
+            tasks = [(index, name, call(finisher, job, trials, *choices[(records[index][0]["index"], name)]))
+                     for index, name, job, trials in trial_sets]
+        else:
+            # Submit all independent method/fold/seed jobs before awaiting results.
+            tasks = [(index, name, call(run_job, job)) for index, name, job in pending]
         for index, name, task in tasks:
-            method_report, result = task.result() if pool else run_job(task)
+            method_report, result = value(task)
             fold_report, _, _, fold_seed = records[index]
             method_report["statistics"] = detailed_statistics(result,periods_per_year=periods_per_year,
                                                              bootstrap_reps=bootstrap_reps,seed=fold_seed)
@@ -263,6 +341,11 @@ def compare_methods(
                                                 instrument=instrument,initial_cash=initial_cash))
         fold_report["baselines"] = {"next_open_buy_and_hold":detailed_statistics(
             baseline,periods_per_year=periods_per_year,bootstrap_reps=bootstrap_reps,seed=fold_seed)}
+        if exposure_controls_enabled:
+            fold_report["exposure_controls"] = {name:exposure_controls(
+                name, results[name], baseline, test, executions[name], periods_per_year=periods_per_year,
+                bootstrap_reps=bootstrap_reps, seed=fold_seed, random_reps=random_timing_reps)
+                for name in METHOD_NAMES}
         if include_paths:fold_report['baseline_backtest']=export_backtest(baseline)
         if stress_instrument:
             stress_baseline=run_backtest(test,np.ones(len(test),dtype=np.int8),replace(baseline.config,
@@ -283,7 +366,7 @@ def compare_methods(
         "Ring portfolios divide one instrument's capital among fixed strategy sleeves; there is no cross-asset allocation.",
         "Instrument costs and financing are declared research assumptions; actual broker swap histories are not inferred." if instrument
         else "No production order routing, partial fills, or funding/borrow costs.",
-        "No claim of deflated Sharpe, probability of backtest overfitting, or full paper baseline reproduction.",
+        "No full paper baseline reproduction. Benchmark summaries report DSR, PBO and SPA over retained paths only; the genetic search itself is not corrected.",
     ]
     # Fail before emitting a misleading report containing NaN/Infinity.
     return json.loads(json.dumps(report, allow_nan=False))

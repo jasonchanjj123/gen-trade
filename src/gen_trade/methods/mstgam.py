@@ -10,6 +10,14 @@ execution guard; action ties hold; ``min_votes=3`` follows the detailed text's
 "more than two" rule. Calendar durations use observation availability times.
 St6 uses fixed timestamp-keyed random draws across fitness evaluations.
 The shared simulator fills next opens and reports terminal liquidations.
+
+Labeled EXTENSIONS (off by default; docs/EXTENSIONS.md): ``fitness="tstat"``
+divides by s*sqrt(n) instead of the population std, so the score is the
+t-statistic of training trades in excess of an annual risk-free rate prorated
+over the training span (audit item 10); ``sign_adjusted`` applies Israelsen's
+(2005) refinement for negative numerators; ``mutation="lognormal"`` replaces
+the uniform one-gene redraw (expected new vote share 1 - ln 2) with a
+multiplicative heavy-tailed step.
 """
 from __future__ import annotations
 
@@ -69,6 +77,32 @@ def _vote_totals(buy: np.ndarray, sell: np.ndarray, hold: np.ndarray, active: np
     signals[(buy > sell + eps) & (active | (buy > hold + eps))] = 1
     signals[(sell > buy + eps) & (active | (sell > hold + eps))] = -1
     return signals
+
+
+FITNESS_VARIANTS = ("paper", "tstat")
+MUTATION_VARIANTS = ("paper", "lognormal")
+
+
+def trade_fitness(count: int, total: float, population_std: float, *, risk_free_return: float = 0.025,
+                  variant: str = "paper", sign_adjusted: bool = False, years: float = 1.0) -> float:
+    """Shared paper/extension trade score from sufficient statistics.
+
+    paper: (sum q - Rf) / population std, Eqs.9/12.
+    tstat: (sum q - Rf_annual * years) / (sample std * sqrt(n)), the t-statistic.
+    sign_adjusted: for a negative numerator multiply by the denominator instead
+    (Israelsen 2005), so more risk can no longer improve a losing score.
+    """
+    if count < 2 or not np.isfinite(total) or not np.isfinite(population_std) or population_std <= 1e-12:
+        return INVALID_FITNESS
+    if variant == "paper":
+        numerator, denominator = total - risk_free_return, population_std
+    elif variant == "tstat":
+        sample_std = population_std * np.sqrt(count / (count - 1))
+        numerator, denominator = total - risk_free_return * years, sample_std * np.sqrt(count)
+    else:
+        raise ValueError(f"fitness variant must be one of {FITNESS_VARIANTS}")
+    score = numerator * denominator if sign_adjusted and numerator < 0 else numerator / denominator
+    return float(np.clip(score, -1e9, 1e9)) if np.isfinite(score) else INVALID_FITNESS
 
 
 def paper_sharpe(trade_returns: np.ndarray, risk_free_return: float = 0.025) -> float:
@@ -186,7 +220,17 @@ class MSTGAM:
     def __init__(self, population_size: int = 150, generations: int = 50,
                  seed: int = 0, min_votes: int = 3,
                  execution: ExecutionConfig | None = None,
-                 crossover_probability: float = 0.95, risk_free_return: float = 0.025):
+                 crossover_probability: float = 0.95, risk_free_return: float = 0.025, *,
+                 fitness: str = "paper", sign_adjusted: bool = False, mutation: str = "paper",
+                 mutation_scale: float = 0.5):
+        if fitness not in FITNESS_VARIANTS:
+            raise ValueError(f"fitness must be one of {FITNESS_VARIANTS}")
+        if mutation not in MUTATION_VARIANTS:
+            raise ValueError(f"mutation must be one of {MUTATION_VARIANTS}")
+        if not np.isfinite(mutation_scale) or mutation_scale <= 0:
+            raise ValueError("mutation_scale must be positive")
+        self.fitness, self.sign_adjusted, self.mutation = fitness, bool(sign_adjusted), mutation
+        self.mutation_scale = float(mutation_scale)
         for name, value, lower in (("population_size", population_size, 2),
                                    ("generations", generations, 0), ("seed", seed, 0),
                                    ("min_votes", min_votes, 1)):
@@ -233,8 +277,10 @@ class MSTGAM:
         key = np.asarray(signals, dtype=np.int8).tobytes()
         if key not in self._fitness_cache:
             result = run_backtest(frame, signals, self.execution)
-            self._fitness_cache[key] = (paper_sharpe(result.trade_returns, self.risk_free_return),
-                                        int(len(result.trade_returns)))
+            values = np.asarray(result.trade_returns, dtype=float)
+            self._fitness_cache[key] = (self._trade_score(len(values), float(values.sum()),
+                                                          float(np.std(values, ddof=0)) if len(values) else 0.0),
+                                        int(len(values)))
         else:
             self._cache_hits += 1
         return self._fitness_cache[key]
@@ -248,12 +294,41 @@ class MSTGAM:
         if missing:
             result=execute_batch(self._prepared_market,np.column_stack(list(missing.values())),self.execution)
             for i,key in enumerate(missing):
-                count=int(result.trade_counts[i]); std=float(result.trade_return_std[i])
-                score=(result.trade_return_sum[i]-self.risk_free_return)/std if count>=2 and std>1e-12 else INVALID_FITNESS
-                score=float(np.clip(score,-1e9,1e9)) if score!=INVALID_FITNESS and np.isfinite(score) else INVALID_FITNESS
-                self._fitness_cache[key]=(score,count)
+                count=int(result.trade_counts[i])
+                self._fitness_cache[key]=(self._trade_score(count,float(result.trade_return_sum[i]),
+                                                            float(result.trade_return_std[i])),count)
         self._cache_hits+=len(keys)-len(missing)
         return [self._fitness_cache[key] for key in keys]
+
+    def _trade_score(self, count: int, total: float, population_std: float) -> float:
+        return trade_fitness(count, total, population_std, risk_free_return=self.risk_free_return,
+                             variant=self.fitness, sign_adjusted=self.sign_adjusted,
+                             years=getattr(self, "_training_years", 1.0))
+
+    def _mutate(self, child: np.ndarray, rng: np.random.Generator) -> None:
+        gene = int(rng.integers(len(GENES)))
+        if self.mutation == "paper":
+            child[gene] = rng.uniform(0.0, 1.0)
+            return
+        # Heavy-tailed step size: P(alpha=k) proportional to k^-1.5 on 1..8,
+        # the power-law strength of Doerr et al.'s fast GA, applied in log space.
+        strengths = np.arange(1, 9, dtype=float)
+        probabilities = strengths ** -1.5 / np.sum(strengths ** -1.5)
+        alpha = float(rng.choice(strengths, p=probabilities))
+        child[gene] = max(float(child[gene]), 1e-12) * float(np.exp(self.mutation_scale * alpha * rng.normal()))
+
+    def generation_snapshots(self, every: int = 5) -> list[tuple[int, MSTGAM]]:
+        """Frozen copies holding the best weights after selected generations."""
+        import copy as _copy
+        if not self._fitted:
+            raise RuntimeError("Fit MSTGAM before requesting snapshots")
+        snapshots = []
+        for generation, weights in enumerate(self._generation_weights):
+            if generation % every == 0 or generation == len(self._generation_weights) - 1:
+                model = _copy.copy(self)
+                model.weights_ = normalise_weights(weights)
+                snapshots.append((generation, model))
+        return snapshots
 
     def _cutoffs(self, frame: pd.DataFrame, f: _Features, values: np.ndarray) -> tuple[float | None, float | None]:
         candidates = []
@@ -325,6 +400,7 @@ class MSTGAM:
             from ..market_execution import MarketArrays
             self._prepared_market=MarketArrays.from_bars(frame,self.execution.instrument)
         times, times_ns = self._clock(frame)
+        self._training_years = max(float(times[-1] - times[0]) / (365.25 * 86400), 1e-9)
         prices = frame["close"].to_numpy()
         features = [_profile_features(prices, times, theta) for theta in THRESHOLDS]
         self.calibration_ = self._calibrate(frame, features, times)
@@ -334,6 +410,7 @@ class MSTGAM:
         population /= population.sum(axis=1, keepdims=True)
         best_score, best_weights, best_trades = INVALID_FITNESS, None, 0
         history = []
+        self._generation_weights = []
         buy_mask, sell_mask, hold_mask = (opinions == 1).T, (opinions == -1).T, (opinions == 0).T
         active = np.count_nonzero(opinions, axis=1) >= self.min_votes
         for generation in range(self.generations + 1):
@@ -348,6 +425,7 @@ class MSTGAM:
                 best_weights = population[elite_index].copy()
                 best_trades = evaluations[elite_index][1]
             history.append(float(scores[elite_index]))
+            self._generation_weights.append(population[elite_index].copy())
             if generation == self.generations:
                 break
 
@@ -365,12 +443,15 @@ class MSTGAM:
                     child = first if rng.integers(2) == 0 else second
                 else:
                     child = first
-                    child[int(rng.integers(len(GENES)))] = rng.uniform(0.0, 1.0)
+                    self._mutate(child, rng)
                 children.append(normalise_weights(child))
             population = np.asarray(children)
         self._diagnostics = {
             "training_rows": len(frame), "training_end": frame["available_at"].iloc[-1].isoformat(),
-            "fitness": "paper_trade_sharpe_eq9_ddof0", "best_fitness": float(best_score),
+            "fitness": "paper_trade_sharpe_eq9_ddof0" if self.fitness == "paper" else "extension_trade_tstat_prorated_rf",
+            "variant": {"fitness": self.fitness, "sign_adjusted": self.sign_adjusted, "mutation": self.mutation,
+                        "training_years": self._training_years},
+            "best_fitness": float(best_score),
             "best_closed_trades": best_trades, "generation_best": history,
             "unique_signal_evaluations": len(self._fitness_cache), "fitness_cache_hits": self._cache_hits,
             "ignored_external_features": ignored,
@@ -404,6 +485,8 @@ class MSTGAM:
             "seed": self.seed, "min_votes": self.min_votes,
             "crossover_probability": self.crossover_probability,
             "risk_free_return": self.risk_free_return, "execution": asdict(self.execution),
+            "fitness": self.fitness, "sign_adjusted": self.sign_adjusted, "mutation": self.mutation,
+            "mutation_scale": self.mutation_scale,
             "weights": self.weights_.tolist(), "thresholds": list(THRESHOLDS),
             "genes": [{"strategy": strategy, "threshold_index": index} for strategy, index in GENES],
             "calibration": [asdict(item) for item in self.calibration_],

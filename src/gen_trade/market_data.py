@@ -246,3 +246,39 @@ def load_dataset(directory: str | Path) -> tuple[dict[str,pd.DataFrame], dict]:
             raise ValueError(f'Dataset integrity mismatch: {symbol}')
         markets[symbol] = validate_bars(pd.read_parquet(path))
     return markets, manifest
+
+
+def merge_fx_weekend_stubs(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """EXTENSION (audit item 13): fold each Sunday FX stub into the next session.
+
+    Dukascopy's Sunday daily candle covers only the few hours after the weekly
+    open, yet indicators would count it as a full period. The stub is merged
+    causally into the following bar (within two days): open quotes from the
+    stub, close quotes and availability from the following bar, high/low as
+    extremes and feed volumes summed. The merged bar keeps the stub's opening
+    timestamp, so no information becomes available earlier than before.
+    """
+    data = validate_bars(frame).copy()
+    stamps = pd.DatetimeIndex(data['timestamp'])
+    drop = []
+    merged = 0
+    for i in np.flatnonzero(stamps.day_of_week == 6):
+        nxt = i + 1
+        if nxt >= len(data) or stamps[nxt] - stamps[i] > pd.Timedelta(days=2):
+            continue
+        for prefix in ('', 'bid_', 'ask_'):
+            high, low = f'{prefix}high', f'{prefix}low'
+            if high in data:
+                data.loc[nxt, high] = max(data.loc[i, high], data.loc[nxt, high])
+                data.loc[nxt, low] = min(data.loc[i, low], data.loc[nxt, low])
+            opening = f'{prefix}open'
+            if opening in data:
+                data.loc[nxt, opening] = data.loc[i, opening]
+        for name in ('bid_feed_volume', 'ask_feed_volume'):
+            if name in data:
+                data.loc[nxt, name] = data.loc[i, name] + data.loc[nxt, name]
+        data.loc[nxt, 'timestamp'] = data.loc[i, 'timestamp']
+        drop.append(i)
+        merged += 1
+    data = data.drop(index=drop).reset_index(drop=True)
+    return validate_bars(data), merged

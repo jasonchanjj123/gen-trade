@@ -49,8 +49,14 @@ class MarketArrays:
         else:
             raw_open = values('execution_open') if 'execution_open' in frame else values('open')
             raw_close = values('execution_close') if 'execution_close' in frame else values('close')
-            half = spec.spread_bps/20000
-            bo,ao,bc,ac = raw_open*(1-half),raw_open*(1+half),raw_close*(1-half),raw_close*(1+half)
+            if spec.minimum_spread == 0:
+                half = spec.spread_bps/20000
+                bo,ao,bc,ac = raw_open*(1-half),raw_open*(1+half),raw_close*(1-half),raw_close*(1+half)
+            else:
+                # Full spread = max(proportional spread, absolute tick floor), split evenly.
+                half_open = np.maximum(raw_open*spec.spread_bps/20000, spec.minimum_spread/2)
+                half_close = np.maximum(raw_close*spec.spread_bps/20000, spec.minimum_spread/2)
+                bo,ao,bc,ac = raw_open-half_open,raw_open+half_open,raw_close-half_close,raw_close+half_close
         if any((v<=0).any() for v in (bo,ao,bc,ac)) or (ao<bo).any() or (ac<bc).any():
             raise ValueError('Execution quotes must be positive, aligned and uncrossed')
         if spec.quote_currency==spec.account_currency:
@@ -96,6 +102,12 @@ class MarketBatch:
     financing: np.ndarray
     dividends: np.ndarray
     months: tuple
+    trade_log_growth: np.ndarray | None = None
+
+    @property
+    def compounded_trade_return(self) -> np.ndarray:
+        """Scale-free sum of log(1+q) mapped back to a compounded fraction."""
+        return np.expm1(self.trade_log_growth) if self.trade_log_growth is not None else None
 
 
 def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,stop_loss=None,record=False):
@@ -119,7 +131,7 @@ def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,sto
     position_fees=np.zeros(m); position_carry=np.zeros(m); position_income=np.zeros(m)
     pending=np.zeros(m,dtype=np.int8)
     total_fees=np.zeros(m); total_carry=np.zeros(m); total_dividends=np.zeros(m)
-    counts=np.zeros(m,dtype=int); return_sum=np.zeros(m); means=np.zeros(m); m2=np.zeros(m)
+    counts=np.zeros(m,dtype=int); return_sum=np.zeros(m); means=np.zeros(m); m2=np.zeros(m); log_growth=np.zeros(m)
     unit_profit=np.zeros(m); first_unit_capital=np.zeros(m)
     monthly_sum=np.zeros((len(market.months),m)); monthly_counts=np.zeros_like(monthly_sum,dtype=int)
     equity_path=np.empty((len(market.times)+1,m)) if record else None
@@ -176,6 +188,7 @@ def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,sto
         old=counts[ids].copy(); counts[ids]+=1
         delta=q-means[ids]; means[ids]+=delta/counts[ids]; m2[ids]+=delta*(q-means[ids])
         return_sum[ids]+=q
+        log_growth[ids]+=np.log1p(np.maximum(q,-1+1e-12))
         monthly_sum[month,ids]+=q; monthly_counts[month,ids]+=1
         unit_profit[ids]+=pnl[ids]/original_quantity[ids]
         first=ids[old==0]; first_unit_capital[first]=entry_capital[first]/original_quantity[first]
@@ -258,7 +271,7 @@ def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,sto
     std=np.sqrt(np.maximum(np.divide(m2,counts,out=np.zeros_like(m2),where=counts>0),0))
     paper=np.divide(100*unit_profit,first_unit_capital,out=np.zeros(m),where=first_unit_capital>0)
     return MarketBatch(equity_path,last_equity,counts,return_sum,std,paper,monthly.T,monthly_counts.T,ledger,
-                       total_fees,total_carry,total_dividends,market.months)
+                       total_fees,total_carry,total_dividends,market.months,log_growth)
 
 
 def run_market_backtest(bars,signals,config):

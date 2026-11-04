@@ -91,10 +91,66 @@ def physical_features(bars: pd.DataFrame) -> dict[str, np.ndarray]:
     return result
 
 
+FEATURE_TRANSFORMS = ("paper", "scale_free")
+
+
+def scale_free_physical(bars: pd.DataFrame, features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """EXTENSION (audit item 2): remove price level from level-type terminals.
+
+    Moving averages, EMAs and SAR become relative distance from the current
+    close; ATR becomes a fraction of close; OBV becomes its 20-observation
+    change divided by the volume traded over the same window. Each output is
+    causal and dimensionless, so training min/max bounds stay meaningful when a
+    later test year trades at a very different price level. Oscillators (RSI,
+    CCI, Williams %R) are already dimensionless and are left unchanged.
+    """
+    frame = validate_bars(bars)
+    close = frame["close"].to_numpy(dtype=float)
+    volume = frame["volume"].to_numpy(dtype=float)
+    out = dict(features)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for name, values in features.items():
+            if name.startswith(("ta_ma_", "ta_ema_")) or name == "ta_psar":
+                out[name] = values / close - 1.0
+            elif name.startswith("ta_atr_"):
+                out[name] = values / close
+        if "ta_obv" in features:
+            obv = pd.Series(features["ta_obv"])
+            flow = pd.Series(volume).rolling(20, min_periods=20).sum().to_numpy()
+            change = (obv - obv.shift(20)).to_numpy()
+            out["ta_obv"] = np.where(flow > 0, change / flow, np.nan)
+    return out
+
+
+# Families whose members share units after the scale-free transform. Members of
+# one family share min/max bounds so that comparing, e.g., MA10 with MA50 in a
+# GP tree compares the same economic quantity rather than two rescalings.
+SCALE_FAMILIES = (("price_ratio", ("ta_ma_", "ta_ema_", "ta_psar")), ("atr_ratio", ("ta_atr_",)),
+                  ("rsi", ("ta_rsi_",)), ("willr", ("ta_willr_",)), ("cci", ("ta_cci_",)),
+                  ("osv", ("dc_osv", "dc_avg_osv_")), ("tdc", ("dc_tdc", "dc_avg_tdc_")),
+                  ("rdc", ("dc_rdc", "dc_avg_rdc_")))
+
+
+def feature_families(names) -> dict[str, str]:
+    groups = {}
+    for name in names:
+        for family, prefixes in SCALE_FAMILIES:
+            if name.startswith(prefixes):
+                groups[name] = family
+                break
+    return groups
+
+
 def raw_features(
     bars: pd.DataFrame, threshold: float, extra_features: dict[str, np.ndarray] | None = None,
+    *, transform: str = "paper",
 ) -> dict[str, np.ndarray]:
-    features = {**dc_features(bars, threshold), **physical_features(bars)}
+    if transform not in FEATURE_TRANSFORMS:
+        raise ValueError(f"feature transform must be one of {FEATURE_TRANSFORMS}")
+    physical = physical_features(bars)
+    if transform == "scale_free":
+        physical = scale_free_physical(bars, physical)
+    features = {**dc_features(bars, threshold), **physical}
     for name, raw in (extra_features or {}).items():
         if not isinstance(name, str) or not name:
             raise ValueError("Extra feature names must be nonempty strings")
@@ -116,11 +172,19 @@ class FeatureScaler:
     bounds: dict[str, tuple[float, float]]
 
     @classmethod
-    def fit(cls, features: dict[str, np.ndarray]) -> FeatureScaler:
+    def fit(cls, features: dict[str, np.ndarray], groups: dict[str, str] | None = None) -> FeatureScaler:
+        """Per-feature bounds, or shared bounds across each named feature family."""
         bounds = {}
         for name, values in features.items():
             finite = np.asarray(values)[np.isfinite(values)]
             bounds[name] = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 0.0)
+        for family in set((groups or {}).values()):
+            members = [name for name, group in groups.items() if group == family and name in bounds
+                       and bounds[name][1] >= bounds[name][0] and np.isfinite(features[name]).any()]
+            if members:
+                shared = (min(bounds[n][0] for n in members), max(bounds[n][1] for n in members))
+                for name in members:
+                    bounds[name] = shared
         return cls(bounds)
 
     def transform(self, features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

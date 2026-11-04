@@ -4,6 +4,12 @@ Implements §3.3.2--5, Eqs.6--16, Algorithms 1/4 and Table 5 defaults.
 The paper omits exact indicator rules, bank ranking, weight-bit encoding and
 several execution details. Those choices are explicit in docs/IGTSP_RING.md.
 Section 3.1's alternative objective is NOT silently mixed into Eq.6.
+
+Labeled EXTENSIONS (off by default; docs/EXTENSIONS.md): mixture-drawdown
+fitness, bitwise mutation on every child, duplicate-free children, a
+Falkenauer-style group-injection crossover, a correlation-diverse facility-
+location bank, two-stage bank ranking under the evolved TP/SL, and an adaptive
+migration interval (Mambrini and Sudholt 2015, scheme B).
 """
 from __future__ import annotations
 
@@ -19,7 +25,8 @@ from ..backtest import ExecutionConfig, PortfolioSignals
 from ..data import validate_bars
 from ..parallel import process_pool
 from .ring_bank import DEFAULT_BANK, INDICATORS, Strategy, strategy_signals
-from .ring_fitness import INVALID_FITNESS, MonthlyProfiles, PreparedMarket, monthly_trade_profiles, portfolio_fitness
+from .ring_fitness import (FITNESS_VARIANTS, INVALID_FITNESS, MonthlyProfiles, PreparedMarket,
+                           monthly_trade_profiles, portfolio_fitness)
 
 SOURCE_DOI = "10.1080/0305215X.2025.2592030"
 SOURCE_PDF_SHA256 = "7ccf3ab38a5609ffc5b89e72521587ecb6d9b7b42bdf18b2fa299765b8b31d42"
@@ -28,6 +35,11 @@ PAPER_SETTINGS = {"population_size":150, "generations":100, "island_count":10, "
                   "migration_rate":.5, "migration_interval":10, "crossover_probability":.6,
                   "mutation_probability":.01, "selection_rate":.5, "inversion_probability":.1,
                   "take_profit_bits":8, "stop_loss_bits":8}
+CROSSOVER_MODES = ("paper", "group")
+MUTATION_MODES = ("paper", "bitwise")
+BANK_SELECTIONS = ("paper", "diverse")
+BANK_RANKINGS = ("paper", "two_stage")
+MIGRATION_SCHEDULES = ("paper", "adaptive")
 
 
 def decode_bits(bits: tuple[int, ...]) -> int:
@@ -145,6 +157,67 @@ def mutate(chromosome: GroupChromosome, rng: np.random.Generator) -> GroupChromo
     return GroupChromosome(tuple(labels), tuple(tuple(bits) for bits in weights), tuple(tpsl[:n_tp]), tuple(tpsl[n_tp:]))
 
 
+def group_crossover(first: GroupChromosome, second: GroupChromosome, rng: np.random.Generator) -> GroupChromosome:
+    """EXTENSION: inject whole groups of ``second`` (members and weight bits).
+
+    Label-wise n-point crossover mixes two arbitrary labelings of possibly the
+    same grouping (m! equivalent chromosomes, Lewis and Pullin). Falkenauer's
+    grouping GA instead transmits whole groups. Here a random nonempty, proper
+    subset of labels is copied from the second parent; strategies the first
+    parent placed in those labels but the second did not are reassigned to a
+    random retained label; empty groups are repaired. TP/SL use the paper splice.
+    """
+    k, n = len(first.weight_bits), len(first.assignments)
+    if (len(second.weight_bits), len(second.assignments)) != (k, n):
+        raise ValueError("Parents must have the same strategy and group dimensions")
+    inject = rng.random(k) < .5
+    if inject.all() or not inject.any():
+        inject[:] = False
+        inject[int(rng.integers(k))] = True
+    labels = [-1] * n
+    weights = list(first.weight_bits)
+    for strategy, label in enumerate(second.assignments):
+        if inject[label]:
+            labels[strategy] = label
+    for label in np.flatnonzero(inject):
+        weights[int(label)] = second.weight_bits[int(label)]
+    kept = np.flatnonzero(~inject)
+    for strategy, label in enumerate(first.assignments):
+        if labels[strategy] == -1:
+            labels[strategy] = label if not inject[label] else int(rng.choice(kept))
+    labels = _repair_groups(tuple(int(x) for x in labels), k, rng)
+    cut_source = first.take_profit_bits + first.stop_loss_bits
+    other = second.take_profit_bits + second.stop_loss_bits
+    cut = int(rng.integers(1, len(cut_source))) if len(cut_source) > 1 else 1
+    tpsl = cut_source[:cut] + other[cut:]
+    n_tp = len(first.take_profit_bits)
+    return GroupChromosome(labels, tuple(weights), tpsl[:n_tp], tpsl[n_tp:])
+
+
+def bitwise_mutate(chromosome: GroupChromosome, rng: np.random.Generator) -> GroupChromosome:
+    """EXTENSION: standard-bit mutation on each part at rate 1/length.
+
+    The paper operator fires for 1% of children and then changes exactly one
+    TP/SL bit, one weight bit and one strategy, about six mutations per small
+    fit (audit item 9). Here every child mutates: each TP/SL bit and each weight
+    bit flips with probability 1/length of its part, and each strategy moves
+    with probability 1/n while keeping all groups nonempty.
+    """
+    tpsl = np.array(chromosome.take_profit_bits + chromosome.stop_loss_bits)
+    tpsl ^= (rng.random(len(tpsl)) < 1 / len(tpsl)).astype(tpsl.dtype)
+    weights = np.array(chromosome.weight_bits)
+    weights ^= (rng.random(weights.shape) < 1 / weights.size).astype(weights.dtype)
+    labels = list(chromosome.assignments)
+    k = len(chromosome.weight_bits)
+    for position in np.flatnonzero(rng.random(len(labels)) < 1 / len(labels)):
+        counts = np.bincount(labels, minlength=k)
+        if counts[labels[position]] > 1:
+            labels[position] = int(rng.choice([g for g in range(k) if g != labels[position]]))
+    n_tp = len(chromosome.take_profit_bits)
+    return GroupChromosome(tuple(labels), tuple(tuple(int(x) for x in row) for row in weights),
+                           tuple(int(x) for x in tpsl[:n_tp]), tuple(int(x) for x in tpsl[n_tp:]))
+
+
 def invert(chromosome: GroupChromosome, rng: np.random.Generator) -> GroupChromosome:
     """Reverse two selected groups' membership order, keeping position weights."""
     a, b = (int(x) for x in rng.choice(len(chromosome.weight_bits), 2, replace=False))
@@ -162,6 +235,12 @@ class _Evaluator:
     risk_floor: float
     ratio_cap: float
     profiles: OrderedDict = field(default_factory=OrderedDict)
+    variant: str = "paper"
+    sign_adjusted: bool = False
+
+    def _fitness(self, chromosome, profile):
+        return portfolio_fitness(chromosome, profile.wealth, profile.trade_counts, risk_floor=self.risk_floor,
+                                 ratio_cap=self.ratio_cap, variant=self.variant, sign_adjusted=self.sign_adjusted)
 
     def evaluate(self, chromosome):
         if self.execution.instrument is not None:
@@ -174,9 +253,7 @@ class _Evaluator:
             if len(self.profiles) > 256:
                 self.profiles.popitem(last=False)
         self.profiles.move_to_end(key)
-        profile = self.profiles[key]
-        return portfolio_fitness(chromosome, profile.wealth, profile.trade_counts,
-                                 risk_floor=self.risk_floor, ratio_cap=self.ratio_cap)
+        return self._fitness(chromosome, self.profiles[key])
 
     def evaluate_many(self,chromosomes):
         if self.execution.instrument is None:
@@ -200,8 +277,7 @@ class _Evaluator:
                                         batch.monthly_trade_counts[view],batch.months)
                 profiles[key]=profile; self.profiles[key]=profile
                 if len(self.profiles)>256:self.profiles.popitem(last=False)
-        return [portfolio_fitness(c,profiles[key_for(c)].wealth,profiles[key_for(c)].trade_counts,
-                                  risk_floor=self.risk_floor,ratio_cap=self.ratio_cap) for c in chromosomes]
+        return [self._fitness(c,profiles[key_for(c)]) for c in chromosomes]
 
 
 @dataclass
@@ -210,6 +286,7 @@ class _Island:
     rng: np.random.Generator
     cache: dict[GroupChromosome, dict] = field(default_factory=dict)
     history: list[dict] = field(default_factory=list)
+    best: list = field(default_factory=list)
 
     def score(self, chromosome, evaluator=None):
         if chromosome not in self.cache:
@@ -230,25 +307,48 @@ def _advance_island(island: _Island, evaluator: _Evaluator, steps: int, settings
     def precache(candidates):
         missing=list(dict.fromkeys(c for c in candidates if c not in island.cache))
         island.cache.update(zip(missing,evaluator.evaluate_many(missing)))
+    crossover_mode = settings.get("crossover_mode", "paper")
+    mutation_mode = settings.get("mutation_mode", "paper")
+    unique = settings.get("unique_children", False)
+    recombine = group_crossover if crossover_mode == "group" else crossover
+
+    def breed(parents):
+        child = parents[int(island.rng.integers(len(parents)))]
+        if island.rng.random() < settings["crossover_probability"]:
+            child = recombine(child, parents[int(island.rng.integers(len(parents)))], island.rng)
+        if mutation_mode == "bitwise":
+            child = bitwise_mutate(child, island.rng)
+        elif island.rng.random() < settings["mutation_probability"]:
+            child = mutate(child, island.rng)
+        if island.rng.random() < settings["inversion_probability"]:
+            child = invert(child, island.rng)
+        return child
+
     if not island.history:
         precache(island.population)
         island.population.sort(key=score, reverse=True)
         island.history.append({"generation":0, "best_fitness":score(island.population[0])})
+        island.best.append(island.population[0])
     for _ in range(steps):
         parents = elite_selection(island, settings["selection_rate"], evaluator)
         children = list(parents)
+        seen = set(island.population) | set(children)
         while len(children) < len(island.population):
-            child = parents[int(island.rng.integers(len(parents)))]
-            if island.rng.random() < settings["crossover_probability"]:
-                child = crossover(child, parents[int(island.rng.integers(len(parents)))], island.rng)
-            if island.rng.random() < settings["mutation_probability"]:
-                child = mutate(child, island.rng)
-            if island.rng.random() < settings["inversion_probability"]:
-                child = invert(child, island.rng)
+            child = breed(parents)
+            if unique:
+                # EXTENSION: resample duplicates; a last bitwise mutation is the fallback.
+                for _attempt in range(20):
+                    if child not in seen:
+                        break
+                    child = breed(parents)
+                if child in seen:
+                    child = bitwise_mutate(child, island.rng)
+                seen.add(child)
             children.append(child)
         precache(children)
         island.population = sorted(children, key=score, reverse=True)
         island.history.append({"generation":len(island.history), "best_fitness":score(island.population[0])})
+        island.best.append(island.population[0])
     return island
 
 
@@ -296,13 +396,58 @@ def ring_migrate(islands: list[_Island], count: int | None = None, *, migration_
     return events
 
 
+def facility_location_bank(monthly_returns: np.ndarray, returns: np.ndarray, risks: np.ndarray,
+                           qualified: np.ndarray, size: int, pool_multiple: int = 4) -> np.ndarray:
+    """EXTENSION: correlation-diverse bank by greedy facility location.
+
+    Candidates are qualified strategies with positive training return, ranked
+    by training return/risk; the best ``pool_multiple*size`` form the pool.
+    Greedy maximization of f(A) = sum_j max_{i in A} (1 + corr_ij)/2 over the
+    pool is monotone submodular, so greedy selection is within (1 - 1/e) of
+    the best ``size``-subset for this coverage objective (Nemhauser, Wolsey and
+    Fisher 1978). Remaining slots, if any, fall back to the paper ranking.
+    """
+    ratio = returns / np.maximum(risks, 1e-12)
+    positive = qualified[returns[qualified] > 0]
+    order = positive[np.lexsort((positive, -ratio[positive]))]
+    pool = order[:max(size, pool_multiple * size)]
+    if len(pool) <= size:
+        fallback = qualified[np.lexsort((qualified, risks[qualified], -returns[qualified]))]
+        return np.asarray(list(pool) + [i for i in fallback if i not in set(pool)][:size - len(pool)])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        correlation = np.corrcoef(monthly_returns[pool])
+    correlation = np.nan_to_num(correlation, nan=0.0)
+    np.fill_diagonal(correlation, 1.0)
+    similarity = (1.0 + correlation) / 2.0
+    chosen: list[int] = []
+    coverage = np.zeros(len(pool))
+    for _ in range(size):
+        gains = np.maximum(similarity, coverage[None, :]).sum(axis=1) - coverage.sum()
+        gains[chosen] = -np.inf
+        best = int(np.argmax(gains))
+        chosen.append(best)
+        coverage = np.maximum(coverage, similarity[best])
+    return pool[np.asarray(chosen)]
+
+
 class IGTSPRing:
     def __init__(self, population_size=150, generations=100, seed=0, *, island_count=10,
                  groups=17, strategy_count=34, take_profit_bits=8, stop_loss_bits=8, weight_bits=8,
                  take_profit_limit=.1, stop_loss_limit=.1, migration_interval=10, migration_rate=.5,
                  migrants=None, island_workers=1, crossover_probability=.6, mutation_probability=.01,
                  inversion_probability=.1, selection_rate=.5, risk_floor=1e-12, ratio_cap=1e9,
-                 bank: tuple[Strategy, ...] | None = None, execution: ExecutionConfig | None = None):
+                 bank: tuple[Strategy, ...] | None = None, execution: ExecutionConfig | None = None,
+                 fitness: str = "paper", sign_adjusted: bool = False, crossover_mode: str = "paper",
+                 mutation_mode: str = "paper", unique_children: bool = False, bank_selection: str = "paper",
+                 bank_ranking: str = "paper", migration_schedule: str = "paper"):
+        for name, value, allowed in (("fitness", fitness, FITNESS_VARIANTS), ("crossover_mode", crossover_mode, CROSSOVER_MODES),
+                                     ("mutation_mode", mutation_mode, MUTATION_MODES), ("bank_selection", bank_selection, BANK_SELECTIONS),
+                                     ("bank_ranking", bank_ranking, BANK_RANKINGS),
+                                     ("migration_schedule", migration_schedule, MIGRATION_SCHEDULES)):
+            if value not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}")
+        self.fitness, self.sign_adjusted = fitness, bool(sign_adjusted)
+        self.bank_selection, self.bank_ranking, self.migration_schedule = bank_selection, bank_ranking, migration_schedule
         for name, value, minimum in (("population_size",population_size,4), ("generations",generations,0),
                 ("seed",seed,0), ("island_count",island_count,2), ("groups",groups,2),
                 ("strategy_count",strategy_count,2), ("take_profit_bits",take_profit_bits,1),
@@ -339,6 +484,9 @@ class IGTSPRing:
         self.candidate_bank, self.execution = candidate_bank, execution or ExecutionConfig(fee=0.)
         self._settings = dict(crossover_probability=float(crossover_probability), mutation_probability=float(mutation_probability),
                               inversion_probability=float(inversion_probability), selection_rate=float(selection_rate))
+        if crossover_mode != "paper" or mutation_mode != "paper" or unique_children:
+            self._settings.update(crossover_mode=crossover_mode, mutation_mode=mutation_mode,
+                                  unique_children=bool(unique_children))
         self._selected: GroupChromosome | None = None
         self._bank: tuple[Strategy, ...] = ()
         self._diagnostics: dict = {}
@@ -348,8 +496,75 @@ class IGTSPRing:
         if extra_features is not None and (not isinstance(extra_features, Mapping) or len(extra_features)):
             raise ValueError("IGTSP-Ring uses its training-selected strategy bank; external GP features are unsupported")
 
+    def _rank_bank(self, market, pool_signals, take_profit, stop_loss):
+        profile = monthly_trade_profiles(market, pool_signals, replace(self.execution,
+                                         take_profit=take_profit, stop_loss=stop_loss))
+        returns = profile.wealth[:, -1]-1
+        risks = np.max(np.maximum.accumulate(profile.wealth, axis=1)-profile.wealth, axis=1)
+        qualified=np.flatnonzero(profile.trade_counts>=2)
+        if len(qualified)<self.strategy_count:
+            raise ValueError("Too few training-active strategies with two completed trades for the selected bank size")
+        if self.bank_selection == "diverse":
+            return facility_location_bank(profile.mean_returns, returns, risks, qualified, self.strategy_count)
+        ranking=np.lexsort((qualified,risks[qualified],-returns[qualified]))
+        return qualified[ranking[:self.strategy_count]]
+
+    def _evolve(self, evaluator, generations, seed_sequence, seed_tpsl=None):
+        sizes = [self.population_size//self.island_count + (i < self.population_size%self.island_count)
+                 for i in range(self.island_count)]
+        islands = []
+        for size, seed in zip(sizes, seed_sequence.spawn(self.island_count)):
+            rng = np.random.default_rng(seed)
+            population = [random_chromosome(rng, self.strategy_count, self.groups, self.take_profit_bits,
+                                            self.stop_loss_bits, self.weight_bits) for _ in range(size)]
+            if seed_tpsl is not None:
+                # Two-stage extension: half of each island inherits stage-1 TP/SL.
+                population = [replace(c, take_profit_bits=seed_tpsl[0], stop_loss_bits=seed_tpsl[1]) if i % 2 == 0 else c
+                              for i, c in enumerate(population)]
+            islands.append(_Island(population, rng))
+        migrations, global_history, intervals = [], [], []
+        worker_pool = process_pool(min(self.island_workers,self.island_count), initializer=_initialize_island_profiles,
+                                   initargs=(evaluator,)) if self.island_workers > 1 else None
+        adaptive = self.migration_schedule == "adaptive"
+        # Adaptive schemes start from interval 1 and double while islands stall.
+        interval = 1 if adaptive else self.migration_interval
+        best_before = -np.inf
+        try:
+            completed = 0
+            while True:
+                steps = min(interval, generations-completed)
+                if worker_pool:
+                    futures = [worker_pool.submit(_advance_island_worker, island, steps, self._settings) for island in islands]
+                    islands = [future.result() for future in futures]
+                else:
+                    islands = [_advance_island(island, evaluator, steps, self._settings) for island in islands]
+                completed += steps
+                best_now = max(island.score(c, evaluator) for island in islands for c in island.population)
+                if adaptive:
+                    # Scheme B (Mambrini and Sudholt 2015), applied globally: halve
+                    # the interval after an improving epoch, double it otherwise.
+                    # No exchange after the last generation, where it cannot matter.
+                    if completed < generations:
+                        for event in ring_migrate(islands, self.migrants, migration_rate=self.migration_rate, evaluator=evaluator):
+                            migrations.append({"generation":completed, **event})
+                    intervals.append({"generation":completed, "interval":interval, "improved":bool(best_now > best_before)})
+                    interval = max(1, interval//2) if best_now > best_before else min(2*interval, max(generations, 1))
+                elif completed and completed % self.migration_interval == 0:
+                    for event in ring_migrate(islands, self.migrants, migration_rate=self.migration_rate, evaluator=evaluator):
+                        migrations.append({"generation":completed, **event})
+                best_before = max(best_before, best_now)
+                global_history.append({"generation":completed,
+                    "best_fitness":max(island.score(c, evaluator) for island in islands for c in island.population)})
+                if completed == generations:
+                    break
+        finally:
+            if worker_pool:
+                worker_pool.shutdown(wait=True, cancel_futures=True)
+        return islands, sizes, migrations, global_history, intervals
+
     def fit(self, bars: pd.DataFrame, extra_features=None) -> IGTSPRing:
         self._selected, self._bank, self._diagnostics = None, (), {}
+        self._snapshots = []
         self._check_external(extra_features)
         frame = validate_bars(bars)
         market = PreparedMarket.from_bars(frame,self.execution.instrument)
@@ -360,61 +575,45 @@ class IGTSPRing:
             raise ValueError("Too few strategies remain after excluding unavailable volume rules")
         pool_signals = strategy_signals(frame, candidate_bank)
         # The text omits 'best n' ranking: declare return-first and risk/index tie-breaks.
-        initial = monthly_trade_profiles(market, pool_signals, replace(self.execution,
-                                         take_profit=self.take_profit_limit, stop_loss=self.stop_loss_limit))
-        returns = initial.wealth[:, -1]-1
-        risks = np.max(np.maximum.accumulate(initial.wealth, axis=1)-initial.wealth, axis=1)
-        qualified=np.flatnonzero(initial.trade_counts>=2)
-        if len(qualified)<self.strategy_count:
-            raise ValueError("Too few training-active strategies with two completed trades for the selected bank size")
-        ranking=np.lexsort((qualified,risks[qualified],-returns[qualified]))
-        selected_indices=qualified[ranking[:self.strategy_count]]
+        selected_indices = self._rank_bank(market, pool_signals, self.take_profit_limit, self.stop_loss_limit)
+        seeds = np.random.SeedSequence(self.seed)
+        stages = []
+        stage_plan = ([self.generations] if self.bank_ranking == "paper"
+                      else [self.generations//2, self.generations-self.generations//2])
+        seed_tpsl = None
+        for stage, stage_generations in enumerate(stage_plan):
+            if stage:
+                # Two-stage extension (audit item 11): re-rank the pool under the
+                # stage-1 winner's evolved TP/SL, then evolve again on that bank.
+                tp, sl = winner.thresholds(self.take_profit_limit, self.stop_loss_limit)
+                selected_indices = self._rank_bank(market, pool_signals, tp, sl)
+                seed_tpsl = (winner.take_profit_bits, winner.stop_loss_bits)
+            evaluator = _Evaluator(market, pool_signals[:, selected_indices], self.execution, self.take_profit_limit,
+                                   self.stop_loss_limit, self.risk_floor, self.ratio_cap,
+                                   variant=self.fitness, sign_adjusted=self.sign_adjusted)
+            stage_seed = seeds if not stage else np.random.SeedSequence([self.seed, stage])
+            islands, sizes, migrations, global_history, intervals = self._evolve(evaluator, stage_generations, stage_seed, seed_tpsl)
+            candidates = [c for island in islands for c in island.population]
+            final_metrics=evaluator.evaluate_many(candidates)
+            winning_index=max(range(len(candidates)),key=lambda i:final_metrics[i]['fitness'])
+            winner,metrics=candidates[winning_index],final_metrics[winning_index]
+            stages.append({"generations":stage_generations, "selected_pool_indices":[int(i) for i in selected_indices],
+                           "selected_training":metrics,
+                           "take_profit_stop_loss":list(winner.thresholds(self.take_profit_limit, self.stop_loss_limit))})
         self._bank = tuple(candidate_bank[int(i)] for i in selected_indices)
-        evaluator = _Evaluator(market, pool_signals[:, selected_indices], self.execution, self.take_profit_limit,
-                               self.stop_loss_limit, self.risk_floor, self.ratio_cap)
-        sizes = [self.population_size//self.island_count + (i < self.population_size%self.island_count)
-                 for i in range(self.island_count)]
-        islands = []
-        for size, seed in zip(sizes, np.random.SeedSequence(self.seed).spawn(self.island_count)):
-            rng = np.random.default_rng(seed)
-            population = [random_chromosome(rng, self.strategy_count, self.groups, self.take_profit_bits,
-                                            self.stop_loss_bits, self.weight_bits) for _ in range(size)]
-            islands.append(_Island(population, rng))
-        migrations, global_history = [], []
-        worker_pool = process_pool(min(self.island_workers,self.island_count), initializer=_initialize_island_profiles,
-                                   initargs=(evaluator,)) if self.island_workers > 1 else None
-        try:
-            completed = 0
-            while True:
-                steps = min(self.migration_interval, self.generations-completed)
-                if worker_pool:
-                    futures = [worker_pool.submit(_advance_island_worker, island, steps, self._settings) for island in islands]
-                    islands = [future.result() for future in futures]
-                else:
-                    islands = [_advance_island(island, evaluator, steps, self._settings) for island in islands]
-                completed += steps
-                if completed and completed % self.migration_interval == 0:
-                    for event in ring_migrate(islands, self.migrants, migration_rate=self.migration_rate, evaluator=evaluator):
-                        migrations.append({"generation":completed, **event})
-                global_history.append({"generation":completed,
-                    "best_fitness":max(island.score(c, evaluator) for island in islands for c in island.population)})
-                if completed == self.generations:
-                    break
-        finally:
-            if worker_pool:
-                worker_pool.shutdown(wait=True, cancel_futures=True)
-        candidates = [c for island in islands for c in island.population]
-        final_metrics=evaluator.evaluate_many(candidates)
-        winning_index=max(range(len(candidates)),key=lambda i:final_metrics[i]['fitness'])
-        winner,metrics=candidates[winning_index],final_metrics[winning_index]
         if not metrics["eligible"]:
             self._bank = ()
             raise ValueError("IGTSP-Ring found no eligible portfolio with two completed sleeve trades")
         self._selected = winner
+        # Global best chromosome per generation (final stage) for validation curves.
+        for generation in range(min(len(island.best) for island in islands)):
+            leader = max(islands, key=lambda island: island.history[generation]["best_fitness"])
+            self._snapshots.append(leader.best[generation])
         evaluated = {c for island in islands for c in island.cache}
         self._diagnostics = {
             "method":"igtsp_ring", "source_doi":SOURCE_DOI, "source_pdf_sha256":SOURCE_PDF_SHA256,
-            "fidelity":FIDELITY, "paper_fitness_verified":True, "fitness":"section_3.3.3_eq6_to_16",
+            "fidelity":FIDELITY, "paper_fitness_verified":True, "fitness":"section_3.3.3_eq6_to_16"
+            if self.fitness == "paper" else "extension_mixture_drawdown_capital_entropy",
             "training_rows":len(frame), "training_end":frame["available_at"].iloc[-1].isoformat(),
             "training_months":list(market.months), "selected_training":metrics,
             "population_semantics":"total across islands", "island_population_sizes":sizes,
@@ -422,14 +621,35 @@ class IGTSPRing:
             "unique_exit_policies_evaluated":len({(c.take_profit_bits,c.stop_loss_bits) for c in evaluated}),
             "strategy_pool_size":len(candidate_bank), "selected_strategy_count":self.strategy_count,
             "volume_policy":"exclude volume-dependent buy/sell conditions" if volume_missing else "observed volume used",
-            "bank_selection":{"ranking":"monthly terminal return descending; absolute monthly drawdown ascending; stable pool index",
+            "bank_selection":{"ranking":"monthly terminal return descending; absolute monthly drawdown ascending; stable pool index"
+                              if self.bank_selection == "paper" else
+                              "extension: facility-location diversity over the top return/risk pool",
                               "training_only":True, "ranking_take_profit":self.take_profit_limit,
                               "ranking_stop_loss":self.stop_loss_limit,
                               "selected_pool_indices":[int(i) for i in selected_indices]},
             "migration_events":migrations, "global_best_history":global_history,
             "island_history":[island.history for island in islands],
         }
+        if self.fitness != "paper" or self.bank_selection != "paper" or self.bank_ranking != "paper" \
+                or self.migration_schedule != "paper" or self.sign_adjusted or len(self._settings) > 4:
+            self._diagnostics["variant"] = {
+                "fitness":self.fitness, "sign_adjusted":self.sign_adjusted, "bank_selection":self.bank_selection,
+                "bank_ranking":self.bank_ranking, "migration_schedule":self.migration_schedule,
+                **{k:v for k,v in self._settings.items() if k in ("crossover_mode","mutation_mode","unique_children")},
+                "stages":stages, "adaptive_intervals":intervals}
         return self
+
+    def generation_snapshots(self, every: int = 5) -> list[tuple[int, IGTSPRing]]:
+        """Frozen copies holding the final stage's global best per generation."""
+        if self._selected is None:
+            raise RuntimeError("Fit IGTSP-Ring before requesting snapshots")
+        result = []
+        for generation, chromosome in enumerate(self._snapshots):
+            if generation % every == 0 or generation == len(self._snapshots) - 1:
+                model = copy.copy(self)
+                model._selected = chromosome
+                result.append((generation, model))
+        return result
 
     def predict(self, bars: pd.DataFrame, extra_features=None) -> PortfolioSignals:
         if self._selected is None:

@@ -16,6 +16,13 @@ gen-trade benchmark --population 64 --generations 20 --seeds 11 22 33 \
 python scripts/verify-benchmark.py reports/stocks-fx-2015-2025
 ```
 
+`--protocol audited` switches to pooled seed selection, deployment of the
+validated model, at least two validation trades, exposure controls, zero-carry
+primary FX financing (2% debit stress), a one-cent stock spread floor and merged
+FX Sunday stubs. `--method-profile improved` enables the labeled method variants.
+Both are documented in [EXTENSIONS.md](EXTENSIONS.md). The commands above keep the
+original protocol.
+
 The `market-data` extra adds exchange calendars and plotting to the core
 application. Downloads use Python's standard HTTPS client and verified TLS.
 Neither exchange credentials nor live orders are involved. Raw data and generated

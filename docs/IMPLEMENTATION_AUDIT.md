@@ -102,3 +102,15 @@ remain outside the completed implementation. Synthetic checks prove software
 behavior, not profitability. Real-data results remain conditional on the stated
 universe, daily execution conventions, cost assumptions and search budget. See
 [the ring specification](IGTSP_RING.md).
+
+## Extensions after the 2026-11-04 audit
+
+The audit's critical, high and medium findings, and the theory review's
+recommendations, are implemented as labeled opt-in variants and an `audited`
+benchmark protocol; see [EXTENSIONS.md](EXTENSIONS.md). Paper-faithful defaults
+and the original protocol are unchanged, so the existing suites still pass and
+the original GM report reproduces under the new code. `tests/test_extensions.py`
+covers each variant's defining property. The audit's code item (commit before
+citing results) is handled by committing the previously untracked sources
+separately from the extensions.
+

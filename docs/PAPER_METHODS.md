@@ -182,3 +182,12 @@ The runner implements
 configuration validation, fresh train-plus-validation refitting, multiple seeds,
 parallel jobs, all three paired comparisons, and a within-fold/seed Holm family;
 see [the audit and protocol](IMPLEMENTATION_AUDIT.md).
+
+## Labeled extensions
+
+Variants motivated by the audit and the theory review (robust/constrained MOO3,
+t-statistic MSTGAM fitness, mixture-drawdown Ring fitness, diversity-preserving
+operators, NSGA-III survival and others) are documented separately in
+[EXTENSIONS.md](EXTENSIONS.md). They are never enabled by default and never
+described as paper equations.
+

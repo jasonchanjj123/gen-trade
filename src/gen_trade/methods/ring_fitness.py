@@ -108,15 +108,28 @@ def monthly_trade_profiles(market: PreparedMarket, signals: np.ndarray, config: 
     return MonthlyProfiles(wealth, counts.sum(axis=0), means.T, counts.T, market.months)
 
 
+FITNESS_VARIANTS = ("paper", "mixture_drawdown")
+
+
 def portfolio_fitness(chromosome, monthly_wealth: np.ndarray, trade_counts: np.ndarray,
-                      *, risk_floor: float = 1e-12, ratio_cap: float = 1e9) -> dict:
+                      *, risk_floor: float = 1e-12, ratio_cap: float = 1e9,
+                      variant: str = "paper", sign_adjusted: bool = False) -> dict:
     """Paper Eq.6 + Eqs.7--16, exactly aggregated over all group combinations.
 
     Because Eqs.8 and 13 are linear, group means equal explicit enumeration.
     No mean-portfolio drawdown, log-growth objective or weight entropy is used.
     Zero-risk denominators use an explicit finite floor/cap; eligibility needs
     two completed active-sleeve trades. These degeneracy guards are adaptations.
+
+    EXTENSION ``variant="mixture_drawdown"`` (audit item 4): the paper ratio is
+    linear-fractional in the group weights, so its optimum puts all capital on
+    one group. The extension measures return and absolute drawdown on the
+    capital-weighted MIXTURE of member wealth paths, which is nonlinear and
+    rewards low correlation, and replaces membership entropy with entropy of the
+    group capital weights. ``sign_adjusted`` applies Israelsen's refinement.
     """
+    if variant not in FITNESS_VARIANTS:
+        raise ValueError(f"Ring fitness variant must be one of {FITNESS_VARIANTS}")
     paths, counts = np.asarray(monthly_wealth, dtype=float), np.asarray(trade_counts)
     if (paths.ndim != 2 or paths.shape[0] != len(chromosome.assignments) or paths.shape[1] < 2
             or counts.shape != (len(chromosome.assignments),)
@@ -127,15 +140,25 @@ def portfolio_fitness(chromosome, monthly_wealth: np.ndarray, trade_counts: np.n
             or not np.isfinite(ratio_cap) or ratio_cap <= 0):
         raise ValueError("Fitness requires positive normalized monthly wealth, aligned counts and finite positive guards")
     group_weights = chromosome.group_weights()
-    returns = paths[:, -1] - 1
-    drawdowns = np.max(np.maximum.accumulate(paths, axis=1) - paths, axis=1)
-    group_returns = np.array([np.mean(returns[list(members)]) for members in chromosome.groups])
-    group_risks = np.array([np.mean(drawdowns[list(members)]) for members in chromosome.groups])
-    portfolio_return, portfolio_risk = float(group_weights @ group_returns), float(group_weights @ group_risks)
-    proportions = np.array([len(members) for members in chromosome.groups]) / len(chromosome.assignments)
-    balance = float(-np.sum(proportions * np.log(proportions)))
-    ratio = float(np.clip(portfolio_return / max(portfolio_risk, risk_floor), -ratio_cap, ratio_cap))
     weights = chromosome.allocations()
+    if variant == "paper":
+        returns = paths[:, -1] - 1
+        drawdowns = np.max(np.maximum.accumulate(paths, axis=1) - paths, axis=1)
+        group_returns = np.array([np.mean(returns[list(members)]) for members in chromosome.groups])
+        group_risks = np.array([np.mean(drawdowns[list(members)]) for members in chromosome.groups])
+        portfolio_return, portfolio_risk = float(group_weights @ group_returns), float(group_weights @ group_risks)
+        proportions = np.array([len(members) for members in chromosome.groups]) / len(chromosome.assignments)
+        balance = float(-np.sum(proportions * np.log(proportions)))
+    else:
+        mixture = weights @ paths
+        portfolio_return = float(mixture[-1] - 1)
+        portfolio_risk = float(np.max(np.maximum.accumulate(mixture) - mixture))
+        positive = group_weights[group_weights > 0]
+        balance = float(-np.sum(positive * np.log(positive)))
+    raw = portfolio_return / max(portfolio_risk, risk_floor)
+    if sign_adjusted and portfolio_return < 0:
+        raw = portfolio_return * max(portfolio_risk, risk_floor)
+    ratio = float(np.clip(raw, -ratio_cap, ratio_cap))
     count = int(np.sum(counts[weights > 0]))
     eligible = (count >= 2 and bool(np.isfinite(ratio))
                 and (portfolio_risk >= risk_floor or abs(portfolio_return) >= risk_floor))
@@ -143,5 +166,7 @@ def portfolio_fitness(chromosome, monthly_wealth: np.ndarray, trade_counts: np.n
             "paper_portfolio_return":portfolio_return, "paper_portfolio_risk":portfolio_risk,
             "group_balance":balance, "return_risk_ratio":ratio,
             "risk_denominator_floored":portfolio_risk < risk_floor,
-            "ratio_capped":abs(portfolio_return / max(portfolio_risk, risk_floor)) > ratio_cap,
-            "completed_sleeve_trades":count, "fitness_equations":"6-16"}
+            "ratio_capped":abs(raw) > ratio_cap,
+            "completed_sleeve_trades":count,
+            "fitness_equations":"6-16" if variant == "paper" else "extension_mixture_drawdown_capital_entropy",
+            "fitness_variant":variant, "sign_adjusted":sign_adjusted}

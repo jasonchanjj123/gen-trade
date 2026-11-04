@@ -10,10 +10,20 @@ standard NSGA-II infinite endpoint crowding, minimum two completed trades,
 population-variance convention, explicit end liquidation/next-open execution,
 and one deterministic always-buy coverage individual. Paper population/depth/
 generation/operator defaults are retained. Small runs validate software only.
+
+Labeled EXTENSIONS (all off by default; see docs/EXTENSIONS.md):
+``objectives="robust"`` replaces Eq.3 with compounded trade return (scale and
+split invariant) and mean trade return with its lower confidence bound;
+``min_trades_per_year`` adds a constrained-domination activity constraint
+(Deb 2000); ``survival="nsga2_sequential"|"nsga3"`` changes last-front
+truncation; ``feature_transform="scale_free"`` removes price levels and shares
+scaling within feature families; ``threshold_volatility_multiple`` fits the DC
+threshold to training volatility.
 """
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import asdict, dataclass
 from numbers import Real
 
@@ -21,7 +31,10 @@ import numpy as np
 import pandas as pd
 
 from ..backtest import ExecutionConfig, run_backtest
-from .indicators import FeatureScaler, raw_features
+from .indicators import FEATURE_TRANSFORMS, FeatureScaler, feature_families, raw_features
+
+OBJECTIVE_SETS = ("paper", "robust")
+SURVIVAL_RULES = ("nsga2", "nsga2_sequential", "nsga3")
 
 
 @dataclass(frozen=True)
@@ -100,16 +113,44 @@ class _Individual:
     trade_count: int
     rank: int = 0
     crowding: float = 0.0
+    violation: float = 0.0
 
 
-def rank_fronts(population: list[_Individual]) -> list[list[int]]:
-    """Fast vectorized dominance; invalid candidates can never beat valid ones."""
-    values = np.asarray([(-p.objectives[0], -p.objectives[1], p.objectives[2]) for p in population])
+def _minimization(population) -> np.ndarray:
+    return np.asarray([(-p.objectives[0], -p.objectives[1], p.objectives[2]) for p in population], dtype=float)
+
+
+def _crowding(values: np.ndarray) -> np.ndarray:
+    """Standard NSGA-II crowding of one front given minimization values."""
+    distance = np.zeros(len(values))
+    if len(values) <= 2:
+        distance[:] = np.inf
+        return distance
+    for metric in range(values.shape[1]):
+        ordered = np.argsort(values[:, metric], kind="stable")
+        distance[ordered[0]] = distance[ordered[-1]] = np.inf
+        span = values[ordered[-1], metric] - values[ordered[0], metric]
+        if span > 0:
+            distance[ordered[1:-1]] += (values[ordered[2:], metric] - values[ordered[:-2], metric]) / span
+    return distance
+
+
+def rank_fronts(population: list[_Individual], *, constrained: bool = False) -> list[list[int]]:
+    """Fast vectorized dominance; invalid candidates can never beat valid ones.
+
+    ``constrained=True`` is Deb's constrained domination: among infeasible
+    candidates, the smaller constraint violation dominates (paper mode leaves
+    infeasible candidates mutually non-dominated).
+    """
+    values = _minimization(population)
     valid = np.asarray([p.eligible for p in population])
     dominance = ((values[:, None, :] <= values[None, :, :]).all(axis=2)
                  & (values[:, None, :] < values[None, :, :]).any(axis=2)
                  & valid[:, None] & valid[None, :])
     dominance |= valid[:, None] & ~valid[None, :]
+    if constrained:
+        violation = np.asarray([p.violation for p in population], dtype=float)
+        dominance |= (~valid[:, None] & ~valid[None, :]) & (violation[:, None] < violation[None, :])
     remaining = dominance.sum(axis=0)
     fronts = []
     current = np.flatnonzero(remaining == 0)
@@ -152,12 +193,110 @@ def modified_sharpe(
     return scores, {"minimum": lo.tolist(), "maximum": hi.tolist()}
 
 
+def sequential_truncation(values: np.ndarray, keep: int) -> list[int]:
+    """EXTENSION: remove the least-crowded member one at a time, recomputing
+    crowding after every removal (Kukkonen and Deb 2006). Zheng and Doerr
+    (IEEE TEVC 2025) prove front gaps then stay within a constant factor of the
+    minimum, unlike the one-shot crowding computation of classic NSGA-II."""
+    remaining = list(range(len(values)))
+    while len(remaining) > keep:
+        distance = _crowding(values[remaining])
+        # Stable tie-break: the last-listed member with the smallest distance.
+        worst = int(np.flatnonzero(distance == distance.min())[-1])
+        remaining.pop(worst)
+    return remaining
+
+
+def das_dennis(objectives: int, divisions: int) -> np.ndarray:
+    """Uniform simplex reference points (Das and Dennis 1998) for NSGA-III."""
+    points = []
+    def build(prefix, left, depth):
+        if depth == objectives - 1:
+            points.append(prefix + [left])
+            return
+        for value in range(left + 1):
+            build(prefix + [value], left - value, depth + 1)
+    build([], divisions, 0)
+    return np.asarray(points, dtype=float) / divisions
+
+
+def reference_divisions(population_size: int, objectives: int = 3) -> int:
+    divisions = 1
+    while math.comb(divisions + objectives - 1, objectives - 1) < population_size:
+        divisions += 1
+    return divisions
+
+
+def nsga3_truncation(selected: np.ndarray, last: np.ndarray, keep: int,
+                     references: np.ndarray, rng: np.random.Generator) -> list[int]:
+    """EXTENSION: NSGA-III niche-preserving choice of ``keep`` rows of ``last``.
+
+    ``selected`` holds minimization values already admitted from better fronts.
+    Normalization uses the ideal point and per-objective extreme (maximum)
+    values of the combined set, a simple robust variant of Deb and Jain (2014).
+    Wietheger and Doerr (IJCAI 2023) prove NSGA-III never loses a found
+    Pareto-optimal value on 3-objective OneMinMax, where NSGA-II provably can.
+    """
+    combined = np.vstack([selected, last]) if len(selected) else last
+    ideal = combined.min(axis=0)
+    span = combined.max(axis=0) - ideal
+    span[span <= 0] = 1.0
+    normalized = (combined - ideal) / span
+    unit = references / np.maximum(np.linalg.norm(references, axis=1, keepdims=True), 1e-12)
+    projection = normalized @ unit.T
+    distance = np.sqrt(np.maximum((normalized ** 2).sum(axis=1, keepdims=True) - projection ** 2, 0.0))
+    niche = distance.argmin(axis=1)
+    niche_distance = distance[np.arange(len(combined)), niche]
+    count = np.bincount(niche[:len(selected)], minlength=len(references)).astype(float)
+    candidates = list(range(len(selected), len(combined)))
+    chosen: list[int] = []
+    excluded = np.zeros(len(references), dtype=bool)
+    while len(chosen) < keep:
+        open_counts = np.where(excluded, np.inf, count)
+        minimum = open_counts.min()
+        options = np.flatnonzero(open_counts == minimum)
+        reference = int(rng.choice(options))
+        members = [i for i in candidates if niche[i] == reference]
+        if not members:
+            excluded[reference] = True
+            continue
+        if count[reference] == 0:
+            pick = min(members, key=lambda i: niche_distance[i])
+        else:
+            pick = members[int(rng.integers(len(members)))]
+        candidates.remove(pick)
+        chosen.append(pick - len(selected))
+        count[reference] += 1
+    return chosen
+
+
 class MOO3:
     def __init__(
         self, population_size=500, generations=50, seed=0, threshold=0.001,
         max_depth=6, preferences=(1 / 3, 1 / 3, 1 / 3),
-        execution: ExecutionConfig | None = None,
+        execution: ExecutionConfig | None = None, *,
+        objectives: str = "paper", min_trades_per_year: float | None = None,
+        lcb_z: float = 1.0, survival: str = "nsga2", feature_transform: str = "paper",
+        threshold_volatility_multiple: float | None = None,
     ):
+        if objectives not in OBJECTIVE_SETS:
+            raise ValueError(f"objectives must be one of {OBJECTIVE_SETS}")
+        if survival not in SURVIVAL_RULES:
+            raise ValueError(f"survival must be one of {SURVIVAL_RULES}")
+        if feature_transform not in FEATURE_TRANSFORMS:
+            raise ValueError(f"feature_transform must be one of {FEATURE_TRANSFORMS}")
+        if min_trades_per_year is not None and (not np.isfinite(min_trades_per_year) or min_trades_per_year < 0):
+            raise ValueError("min_trades_per_year must be finite and nonnegative or None")
+        if not np.isfinite(lcb_z) or lcb_z < 0:
+            raise ValueError("lcb_z must be finite and nonnegative")
+        if threshold_volatility_multiple is not None and (
+                not np.isfinite(threshold_volatility_multiple) or threshold_volatility_multiple <= 0):
+            raise ValueError("threshold_volatility_multiple must be positive or None")
+        self.objectives, self.survival, self.feature_transform = objectives, survival, feature_transform
+        self.min_trades_per_year = None if min_trades_per_year is None else float(min_trades_per_year)
+        self.lcb_z = float(lcb_z)
+        self.threshold_volatility_multiple = (None if threshold_volatility_multiple is None
+                                              else float(threshold_volatility_multiple))
         if type(population_size) is not int or population_size < 4:
             raise ValueError("population_size must be an integer >=4")
         if type(generations) is not int or generations < 0:
@@ -202,15 +341,45 @@ class MOO3:
         changed = _replace(first, path, replacement)
         return changed if changed.depth <= self.max_depth else first
 
+    def _training_threshold(self, bars: pd.DataFrame) -> float:
+        if self.threshold_volatility_multiple is None:
+            return self.threshold
+        close = pd.to_numeric(bars["close"], errors="raise").to_numpy(dtype=float)
+        sigma = float(np.std(np.diff(np.log(close)), ddof=1)) if len(close) > 2 else 0.0
+        return float(np.clip(self.threshold_volatility_multiple * sigma, 1e-4, 0.5))
+
+    def _objectives(self, count: int, total_paper: float, mean: float, std: float,
+                    log_growth: float) -> tuple[float, float, float]:
+        if self.objectives == "paper":
+            return (total_paper, mean, std)
+        # Scale-free compounded trade return (%), lower confidence bound of the
+        # mean trade return using the sample standard error, and trade std.
+        sample_std = std * math.sqrt(count / (count - 1)) if count > 1 else 0.0
+        lower = mean - self.lcb_z * sample_std / math.sqrt(count) if count else 0.0
+        return (100.0 * math.expm1(log_growth), lower, std)
+
     def fit(self, bars: pd.DataFrame, extra_features: dict[str, np.ndarray] | None = None) -> MOO3:
         self._selected = None
         self._diagnostics = {}
-        raw = raw_features(bars, self.threshold, extra_features)
-        self._scaler = FeatureScaler.fit(raw)
+        self.fitted_threshold_ = self._training_threshold(bars)
+        raw = raw_features(bars, self.fitted_threshold_, extra_features, transform=self.feature_transform)
+        groups = feature_families(raw) if self.feature_transform == "scale_free" else None
+        self._scaler = FeatureScaler.fit(raw, groups)
         features = self._scaler.transform(raw)
         names = tuple(features)
         rng = np.random.default_rng(self.seed)
         cache = {}
+        times = pd.to_datetime(bars["timestamp"], utc=True)
+        known = pd.to_datetime(bars["available_at"], utc=True)
+        years = max((known.iloc[-1] - times.iloc[0]).total_seconds() / (365.25 * 86400), 0.0)
+        minimum = 2 if self.min_trades_per_year is None else max(2, math.ceil(self.min_trades_per_year * years))
+        constrained = self.min_trades_per_year is not None
+
+        def record(tree, count, objectives):
+            finite = bool(np.isfinite(objectives).all())
+            eligible = count >= minimum and finite
+            violation = 0.0 if eligible else float(max(minimum - count, 0) + (0 if finite else minimum + 1))
+            cache[tree] = (objectives if eligible else (-1e12, -1e12, 1e12), eligible, count, violation)
 
         def evaluate_many(trees):
             if self.execution.instrument is None:
@@ -225,11 +394,11 @@ class MOO3:
                 outcomes=execute_batch(prepared_market,decisions,self.execution)
                 for i,tree in enumerate(missing):
                     count=int(outcomes.trade_counts[i])
-                    objectives=(float(outcomes.paper_total_return[i]),
-                                float(outcomes.trade_return_sum[i]/count) if count else 0.,float(outcomes.trade_return_std[i]))
-                    eligible=count>=2 and bool(np.isfinite(objectives).all())
-                    cache[tree]=(objectives if eligible else (-1e12,-1e12,1e12),eligible,count)
-            return [_Individual(tree,*cache[tree]) for tree in trees]
+                    objectives=self._objectives(count,float(outcomes.paper_total_return[i]),
+                        float(outcomes.trade_return_sum[i]/count) if count else 0.,float(outcomes.trade_return_std[i]),
+                        float(outcomes.trade_log_growth[i]))
+                    record(tree,count,objectives)
+            return [self._individual(tree,cache) for tree in trees]
 
         prepared_market=None
 
@@ -238,18 +407,21 @@ class MOO3:
                 signals = evaluate_tree(tree, features, len(bars)).astype(np.int8)
                 result = run_backtest(bars, signals, self.execution)
                 count = len(result.trade_returns)
-                objectives = (result.paper_total_return, float(np.mean(result.trade_returns)) if count else 0.0,
-                              float(np.std(result.trade_returns, ddof=0)) if count else 0.0)
-                eligible = count >= 2 and bool(np.isfinite(objectives).all())
+                returns = np.asarray(result.trade_returns, dtype=float)
+                objectives = self._objectives(
+                    count, result.paper_total_return, float(np.mean(returns)) if count else 0.0,
+                    float(np.std(returns, ddof=0)) if count else 0.0,
+                    float(np.log1p(np.maximum(returns, -1 + 1e-12)).sum()))
                 # Finite placeholder plus eligibility-aware dominance avoids NaN/inf objectives.
-                cache[tree] = (objectives if eligible else (-1e12, -1e12, 1e12), eligible, count)
-            return _Individual(tree, *cache[tree])
+                record(tree, count, objectives)
+            return self._individual(tree, cache)
 
+        references = das_dennis(3, reference_divisions(self.population_size)) if self.survival == "nsga3" else None
         coverage = Node("gt", (Node("constant", value=1.0), Node("constant", value=0.0)))
         population = evaluate_many([coverage]+[self._tree(rng,names,self.max_depth) for _ in range(self.population_size-1)])
         history = []
         for generation in range(self.generations + 1):
-            fronts = rank_fronts(population)
+            fronts = rank_fronts(population, constrained=constrained)
             history.append({"generation": generation, "eligible": sum(p.eligible for p in population),
                             "pareto_size": sum(population[i].eligible for i in fronts[0])})
             if generation == self.generations:
@@ -263,43 +435,73 @@ class MOO3:
                                       for _ in range(self.population_size)])
             combined = population + children
             survival = []
-            for front in rank_fronts(combined):
-                ordered = sorted(front, key=lambda i: combined[i].crowding, reverse=True)
-                survival.extend(ordered[:self.population_size - len(survival)])
+            for front in rank_fronts(combined, constrained=constrained):
+                room = self.population_size - len(survival)
+                if self.survival == "nsga2":
+                    # Paper path, unchanged: every admitted front in crowding order
+                    # (population order feeds the index-based tournaments).
+                    ordered = sorted(front, key=lambda i: combined[i].crowding, reverse=True)
+                    survival.extend(ordered[:room])
+                elif len(front) <= room:
+                    survival.extend(sorted(front, key=lambda i: combined[i].crowding, reverse=True))
+                elif self.survival == "nsga2_sequential":
+                    kept = sequential_truncation(_minimization([combined[i] for i in front]), room)
+                    survival.extend(front[k] for k in kept)
+                else:
+                    chosen = nsga3_truncation(_minimization([combined[i] for i in survival]),
+                                              _minimization([combined[i] for i in front]), room, references, rng)
+                    survival.extend(front[k] for k in chosen)
                 if len(survival) == self.population_size:
                     break
             population = [combined[i] for i in survival]
-        final_front = [population[i] for i in rank_fronts(population)[0] if population[i].eligible]
+        final_front = [population[i] for i in rank_fronts(population, constrained=constrained)[0] if population[i].eligible]
         # Remove duplicate genotypes from the reported front without changing evolution.
         final_front = list({p.tree: p for p in final_front}.values())
         if not final_front:
-            raise ValueError("MOO3 found no eligible strategy with at least two completed trades")
+            raise ValueError("MOO3 found no eligible strategy with at least "
+                             + ("two" if minimum == 2 else str(minimum)) + " completed trades")
         objectives = np.asarray([p.objectives for p in final_front])
         scores, normalization = modified_sharpe(objectives, self.preferences)
         winner = int(np.argmax(scores))
         self._selected = final_front[winner].tree
+        names_of_objectives = (("paper_total_return_pct", "mean_trade_return", "trade_return_std")
+                               if self.objectives == "paper" else
+                               ("compounded_trade_return_pct", "mean_trade_return_lower_bound", "trade_return_std"))
         self._diagnostics = {
             "method": "moo3", "source_doi": "10.1007/s10462-025-11390-9",
-            "unique_evaluations": len(cache), "minimum_completed_trades": 2,
+            "unique_evaluations": len(cache), "minimum_completed_trades": minimum,
+            "variant": {"objectives": self.objectives, "survival": self.survival,
+                        "feature_transform": self.feature_transform,
+                        "constrained_domination": constrained, "fitted_threshold": self.fitted_threshold_},
+            "objective_names": list(names_of_objectives),
             "history": history, "selected_index": winner, "training_front_normalization": normalization,
-            "pareto_front": [{"rule": p.tree.to_dict(), "paper_total_return_pct": p.objectives[0],
-                              "mean_trade_return": p.objectives[1], "trade_return_std": p.objectives[2],
+            "pareto_front": [{"rule": p.tree.to_dict(), **dict(zip(names_of_objectives, p.objectives)),
                               "completed_trades": p.trade_count, "modified_sharpe": float(scores[i])}
                              for i, p in enumerate(final_front)],
             "feature_count": len(names), "training_feature_bounds": {k: list(v) for k, v in self._scaler.bounds.items()},
         }
         return self
 
+    @staticmethod
+    def _individual(tree, cache) -> _Individual:
+        objectives, eligible, count, violation = cache[tree]
+        return _Individual(tree, objectives, eligible, count, violation=violation)
+
     def predict(self, bars: pd.DataFrame, extra_features: dict[str, np.ndarray] | None = None) -> np.ndarray:
         if self._selected is None:
             raise RuntimeError("MOO3 must be fitted before prediction")
-        features = self._scaler.transform(raw_features(bars, self.threshold, extra_features))
+        raw = raw_features(bars, self.fitted_threshold_, extra_features, transform=self.feature_transform)
+        features = self._scaler.transform(raw)
         return evaluate_tree(self._selected, features, len(bars)).astype(np.int8)
 
     def parameters(self) -> dict:
         return {"method": "moo3", "population_size": self.population_size, "generations": self.generations,
                 "seed": self.seed, "threshold": self.threshold, "max_depth": self.max_depth,
                 "preferences": list(self.preferences), "execution": asdict(self.execution),
+                "objectives": self.objectives, "min_trades_per_year": self.min_trades_per_year,
+                "lcb_z": self.lcb_z, "survival": self.survival, "feature_transform": self.feature_transform,
+                "threshold_volatility_multiple": self.threshold_volatility_multiple,
+                "fitted_threshold": getattr(self, "fitted_threshold_", None),
                 "entry_rule": self._selected.to_dict() if self._selected is not None else None}
 
     @property
