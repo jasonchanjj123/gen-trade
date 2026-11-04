@@ -132,6 +132,31 @@ def synthetic_markets(n: int = 480, seed: int = 42) -> dict[str, pd.DataFrame]:
     return result
 
 
+def protocol_header(*, train_bars, test_bars, embargo_bars, validation_bars, on_no_eligible, fold_plan, instrument,
+                    initial_cash, stress_instrument, population_size, generations, periods_per_year, fee, slippage_bps,
+                    workers, island_workers, configs, selection, deploy, min_validation_trades, validation_curves,
+                    exposure_controls_enabled) -> dict:
+    """The report's declared protocol block (also used to audit saved reports)."""
+    return {"train_bars":train_bars if fold_plan is None else None,
+            "test_bars":test_bars if fold_plan is None else None,"embargo_bars":embargo_bars,
+            "validation_bars":validation_bars if fold_plan is None else None,
+            "on_no_eligible":on_no_eligible,
+            "fold_plan_source":"explicit calendar plan" if fold_plan is not None else "rolling bar counts",
+            "instrument":asdict(instrument) if instrument else None,"initial_cash":initial_cash,
+            "stress_instrument":asdict(stress_instrument) if stress_instrument else None,
+            "population_size":population_size,"generations":generations,
+            "periods_per_year":periods_per_year,"common_fee_per_side":fee,
+            "slippage_bps":slippage_bps,"folds_start_flat":True,
+            "parallelism":{"experiment_workers":workers,"island_workers":island_workers,
+                           "backend":"spawn_processes" if workers > 1 or island_workers > 1 else "serial",
+                           "numerical_threads_per_process_worker":1},
+            "candidate_configurations":configs,
+            "selection_scope":selection, "deploy":deploy, "min_validation_trades":min_validation_trades,
+            "validation_curves":validation_curves, "exposure_controls":exposure_controls_enabled,
+            "budget_note":"Equal population/generations per fit; ring population is TOTAL across islands. Calibration, strategy-bank backtests, candidate counts and runtime differ.",
+            "comparison":"research adaptations; not numerical paper reproductions"}
+
+
 def compare_methods(
     markets: dict[str, pd.DataFrame], context: ChromosomeContext, *,
     train_bars: int, test_bars: int, embargo_bars: int = 5, max_folds: int = 3,
@@ -226,24 +251,14 @@ def compare_methods(
         "data_kind":"synthetic test fixture" if synthetic else "user supplied; not independently audited",
         "dataset_sha256":data_hash.hexdigest(), "seed":seed, "seeds":list(run_seeds),
         "methods":list(METHOD_NAMES), "chromosome_context":context.to_dict(),
-        "protocol": {"train_bars":train_bars if fold_plan is None else None,
-                     "test_bars":test_bars if fold_plan is None else None,"embargo_bars":embargo_bars,
-                     "validation_bars":validation_bars if fold_plan is None else None,
-                     "on_no_eligible":on_no_eligible,
-                     "fold_plan_source":"explicit calendar plan" if fold_plan is not None else "rolling bar counts",
-                     "instrument":asdict(instrument) if instrument else None,"initial_cash":initial_cash,
-                     "stress_instrument":asdict(stress_instrument) if stress_instrument else None,
-                     "population_size":population_size,"generations":generations,
-                     "periods_per_year":periods_per_year,"common_fee_per_side":fee,
-                     "slippage_bps":slippage_bps,"folds_start_flat":True,
-                     "parallelism":{"experiment_workers":workers,"island_workers":island_workers,
-                                    "backend":"spawn_processes" if workers > 1 or island_workers > 1 else "serial",
-                                    "numerical_threads_per_process_worker":1},
-                     "candidate_configurations":configs,
-                     "selection_scope":selection, "deploy":deploy, "min_validation_trades":min_validation_trades,
-                     "validation_curves":validation_curves, "exposure_controls":exposure_controls_enabled,
-                     "budget_note":"Equal population/generations per fit; ring population is TOTAL across islands. Calibration, strategy-bank backtests, candidate counts and runtime differ.",
-                     "comparison":"research adaptations; not numerical paper reproductions"},
+        "protocol": protocol_header(train_bars=train_bars,test_bars=test_bars,embargo_bars=embargo_bars,
+                                    validation_bars=validation_bars,on_no_eligible=on_no_eligible,fold_plan=fold_plan,
+                                    instrument=instrument,initial_cash=initial_cash,stress_instrument=stress_instrument,
+                                    population_size=population_size,generations=generations,
+                                    periods_per_year=periods_per_year,fee=fee,slippage_bps=slippage_bps,workers=workers,
+                                    island_workers=island_workers,configs=configs,selection=selection,deploy=deploy,
+                                    min_validation_trades=min_validation_trades,validation_curves=validation_curves,
+                                    exposure_controls_enabled=exposure_controls_enabled),
         "folds":[],
     }
     pending = []

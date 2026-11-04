@@ -10,10 +10,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from gen_trade.benchmark import _code_hash
+from gen_trade.benchmark import PROTOCOLS, _code_hash
 from gen_trade.experiments import METHOD_NAMES
 from gen_trade.instruments import benchmark_spec
-from gen_trade.market_data import load_dataset
+from gen_trade.market_data import load_dataset, merge_fx_weekend_stubs
 
 
 def require(condition, message):
@@ -21,13 +21,19 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def verify(report_directory, data_directory):
+def verify(report_directory, data_directory, expected_source=None):
     directory = Path(report_directory)
     summary = json.loads((directory / "summary.json").read_text())
     markets, manifest = load_dataset(data_directory)
     settings = summary["settings"]
-    source = _code_hash()
-    require(summary["source_sha256"] == source, "Current source/lock differs from benchmark")
+    rules = settings.get("protocol_rules", PROTOCOLS["original"])
+    def spec(symbol, stress=False):
+        return benchmark_spec(symbol, stress=stress, fx_financing=rules["fx_financing"],
+                              stock_minimum_spread=rules["stock_minimum_spread"])
+    # A report is verified against the code that produced it: the current tree
+    # by default, or an explicitly supplied source hash (e.g. an earlier commit).
+    source = expected_source or _code_hash()
+    require(summary["source_sha256"] == source, "Source/lock hash differs from benchmark")
     require(summary["dataset_manifest"] == manifest, "Dataset manifest differs from benchmark")
     for name in ("report.md", "equity.png"):
         require((directory / name).stat().st_size > 0, f"Missing/empty {name}")
@@ -38,13 +44,16 @@ def verify(report_directory, data_directory):
         asset = json.loads((directory / (symbol.replace("/", "_") + ".json")).read_text())
         signature = hashlib.sha256(json.dumps({
             "settings": settings, "data": manifest["instruments"][symbol]["sha256"],
-            "source": source, "instrument": asdict(benchmark_spec(symbol)),
+            "source": source, "instrument": asdict(spec(symbol)),
         }, sort_keys=True).encode()).hexdigest()
         require(asset["benchmark_signature"] == signature, f"{symbol}: checkpoint signature differs")
         require(asset["data_provenance"] == manifest["instruments"][symbol], f"{symbol}: data provenance differs")
-        require(asset["protocol"]["instrument"] == asdict(benchmark_spec(symbol)), f"{symbol}: primary cost profile differs")
+        require(asset["protocol"]["instrument"] == asdict(spec(symbol)), f"{symbol}: primary cost profile differs")
         seen = set()
         bars = markets[symbol]
+        if rules["merge_fx_weekend_stubs"] and "/" in symbol:
+            bars, merged = merge_fx_weekend_stubs(bars)
+            require(asset.get("merged_fx_weekend_stubs") == merged, f"{symbol}: weekend-stub merge differs")
         for fold in asset["folds"]:
             bounds = fold["bounds"]
             year = int(bars.iloc[bounds["test_start"]]["session_date"][:4])
@@ -65,11 +74,13 @@ def verify(report_directory, data_directory):
                 require(len(selection["trials"]) == len(settings["candidate_configurations"][name]), "Candidate trial omitted")
                 stress = method["cost_stress"]
                 require(stress["frozen_model"] is True, "Stress model was not frozen")
-                require(stress["execution"]["instrument"] == asdict(benchmark_spec(symbol, stress=True)), "Stress cost profile differs")
+                require(stress["execution"]["instrument"] == asdict(spec(symbol, stress=True)), "Stress cost profile differs")
                 require(stress["execution"]["slippage_bps"] == 2 * asset["protocol"]["slippage_bps"], "Stress slippage differs")
                 if method.get("status") == "cash_fallback_no_eligible_configuration":
                     fallbacks += 1
                     require(not method["backtest"]["trades"], "Cash fallback contains trades")
+                elif selection["protocol"] == "train/validation/deploy-validated/test":
+                    require(selection["refit_rows"] == bounds["train_stop"] - bounds["train_start"], "Validated model saw validation rows")
                 else:
                     require(selection["refit_rows"] == bounds["validation_stop"] - bounds["train_start"], "Refit length differs")
                 cases.extend([method["backtest"], method["cost_stress"]["backtest"]])
@@ -100,6 +111,8 @@ def verify(report_directory, data_directory):
     require(summary["cash_fallback_method_folds"] == fallbacks, "Cash-fallback count differs")
     expected_rows = {(symbol, seed, name) for symbol in summary["universe"]
                      for seed in settings["seeds"] for name in (*METHOD_NAMES, "buy_and_hold")}
+    if any(row["seed"] == "ensemble" for row in summary["runs"]):
+        expected_rows |= {(symbol, "ensemble", name) for symbol in summary["universe"] for name in METHOD_NAMES}
     rows = {(row["symbol"], row["seed"], row["method"]) for row in summary["runs"]}
     require(rows == expected_rows and len(rows) == len(summary["runs"]), "Summary omits/repeats a declared result")
     return {"status": "passed", "source_sha256": source, "instruments": len(summary["universe"]),
@@ -115,8 +128,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report_directory", nargs="?", default="reports/stocks-fx-2015-2025")
     parser.add_argument("--data-directory", default="data/stocks-fx-2015-2025")
+    parser.add_argument("--expected-source", help="Source/lock hash of the commit that produced the report")
     args = parser.parse_args()
-    result = verify(args.report_directory, args.data_directory)
+    result = verify(args.report_directory, args.data_directory, args.expected_source)
     output = json.dumps(result, indent=2, allow_nan=False) + "\n"
     (Path(args.report_directory) / "verification.json").write_text(output)
     print(output, end="")

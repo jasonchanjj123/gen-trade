@@ -376,7 +376,9 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
                       calendar_protocol={'training_years':3,'validation_years':1,'test_years':list(range(first_test_year,last_test_year+1))})
         if method_profile!='paper' or protocol!='original':
             report.update(periods_per_year_used=periods_per_year,merged_fx_weekend_stubs=merged_stubs,
-                          method_profile=method_profile,protocol=protocol)
+                          method_profile=method_profile,benchmark_protocol=protocol)
+        if not isinstance(report.get('protocol'),dict):
+            raise ValueError(f'{symbol}: report protocol block was overwritten')
         temporary=path.with_suffix('.json.tmp');temporary.write_text(json.dumps(report,allow_nan=False)+'\n');temporary.replace(path)
         reports[symbol]=report
         (directory/'progress.json').write_text(json.dumps({'completed':list(reports),'requested':symbols,'elapsed_seconds':perf_counter()-start},indent=2)+'\n')
