@@ -190,6 +190,7 @@ def detailed_statistics(
     )
     return {
         "period_count": int(n),
+        "execution_ledger":getattr(result,"ledger",None),
         "trade_count": int(trades.size),
         "net_total_return": float(equity[-1] / equity[0] - 1.0),
         "annualized_return": annualized_return,

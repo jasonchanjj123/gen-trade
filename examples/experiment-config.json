@@ -1,0 +1,8 @@
+{
+  "moo3": [{"threshold": 0.001}, {"threshold": 0.005}],
+  "mstgam": [{"min_votes": 3}, {"min_votes": 2}],
+  "igtsp_ring": [
+    {"island_count": 4, "groups": 12, "migration_interval": 1, "migration_rate": 0.5},
+    {"island_count": 4, "groups": 17, "migration_interval": 1, "migration_rate": 0.5}
+  ]
+}

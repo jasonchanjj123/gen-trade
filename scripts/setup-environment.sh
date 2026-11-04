@@ -15,9 +15,22 @@ if ! command -v uv >/dev/null; then
     exit 1
 fi
 cd "$project_root"
+setup_profile="${1:-full}"
+case "$setup_profile" in
+    --core|core) python_extras=(--extra dev --extra storage) ;;
+    --market-data|market-data) python_extras=(--extra dev --extra storage --extra market-data) ;;
+    --full|full) python_extras=(--all-extras) ;;
+    *) echo 'Usage: setup-environment.sh [--core|--market-data|--full]' >&2; exit 2 ;;
+esac
 # uv finds an existing interpreter or downloads the pinned Python with verification.
 env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT="$project_root/.venv" \
-    uv sync --locked --all-extras --python "$(cat .python-version)"
+    uv sync --locked "${python_extras[@]}" --python "$(cat .python-version)"
+if [ "$setup_profile" = --core ] || [ "$setup_profile" = core ] || [ "$setup_profile" = --market-data ] || [ "$setup_profile" = market-data ]; then
+    uv pip check --python "$project_root/.venv/bin/python"
+    "$project_root/.venv/bin/python" "$project_root/environment/verify.py" --core
+    echo 'Core experiment environment installed. Source .venv/bin/activate.'
+    exit 0
+fi
 if ! command -v rustup >/dev/null; then
     curl --fail --show-error --silent --location https://sh.rustup.rs \
         --output "$GEN_TRADE_TOOLS_DIR/rustup-init.sh"

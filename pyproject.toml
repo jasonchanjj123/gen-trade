@@ -4,17 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gen-trade"
-version = "0.1.0"
-description = "Causal research implementations of two directional-change evolutionary trading methods"
+version = "0.4.0"
+description = "Three independent evolutionary trading frameworks with chronological validation and parallel experiments"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy>=2", "pandas>=2.2", "scipy>=1.14", "statsmodels>=0.14",
-    "arch>=7", "deap>=1.4", "TA-Lib>=0.6", "pyarrow>=18",
+    "arch>=7", "deap>=1.4", "TA-Lib>=0.6", "pyarrow>=18", "threadpoolctl>=3.5",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "hypothesis>=6", "maturin>=1.9"]
 storage = ["psycopg[binary,pool]>=3.2", "redis>=5"]
+market-data = ["exchange-calendars>=4.11", "matplotlib>=3.10"]
 research = [
     "freqtrade==2026.10", "optuna>=3.5", "polars>=1", "duckdb>=1",
     "numba>=0.59", "scikit-learn>=1.5", "sqlalchemy>=2", "pydantic>=2",

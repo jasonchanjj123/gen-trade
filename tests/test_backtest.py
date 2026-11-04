@@ -125,9 +125,30 @@ def test_signal_shape_and_alphabet_validation(signals):
 
 @pytest.mark.parametrize("kwargs", [
     {"initial_cash":0}, {"initial_cash":np.inf}, {"fee":-0.01}, {"fee":1},
-    {"slippage_bps":-1}, {"slippage_bps":10_000}, {"take_profit":0},
+    {"slippage_bps":-1}, {"slippage_bps":10_000}, {"take_profit":-.01},
+    {"stop_loss":-.01}, {"stop_loss":1}, {"stop_loss":np.nan},
     {"max_holding_days":0}, {"entry_hours":()}, {"entry_hours":(24,)}, {"entry_hours":(True,)},
 ])
 def test_invalid_execution_parameters(kwargs):
     with pytest.raises(ValueError):
         ExecutionConfig(**kwargs)
+
+
+def test_close_observed_stop_fills_next_open_and_records_reason():
+    bars = candles([100,100,92,103], closes=[100,94,98,103])
+    result = run_backtest(bars,[1,0,0,0],ExecutionConfig(fee=0,stop_loss=.05))
+    assert result.trades[0].entry_index == 1
+    assert result.trades[0].exit_index == 2
+    assert result.trades[0].exit_price == 92
+    assert result.trades[0].reason == 'stop_loss'
+    assert result.trades[0].return_fraction == pytest.approx(-.08)
+
+
+def test_intrabar_stop_is_not_invented_and_zero_encoded_thresholds_are_valid():
+    bars = candles([100,100,100])
+    bars['low'] = 50.
+    stopped = run_backtest(bars,[1,0,0],ExecutionConfig(fee=0,stop_loss=.05))
+    assert stopped.trades[0].reason == 'sample_end'
+    zero = run_backtest(bars,[1,0,0],ExecutionConfig(fee=0,take_profit=0,stop_loss=0))
+    assert zero.trades[0].exit_index == 2
+    assert zero.trades[0].reason == 'stop_loss'

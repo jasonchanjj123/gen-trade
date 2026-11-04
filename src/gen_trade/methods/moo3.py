@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict, dataclass
+from numbers import Real
 
 import numpy as np
 import pandas as pd
@@ -28,6 +29,22 @@ class Node:
     op: str
     children: tuple[Node, ...] = ()
     value: str | float | None = None
+
+    def __post_init__(self):
+        if self.op == "feature":
+            if self.children or not isinstance(self.value, str) or not self.value:
+                raise ValueError("Feature terminal needs a name and no children")
+        elif self.op == "constant":
+            if (self.children or isinstance(self.value, bool) or not isinstance(self.value, Real)
+                    or not np.isfinite(self.value) or not 0 <= self.value <= 1):
+                raise ValueError("Constant terminal must be finite and in [0,1]")
+        elif self.op in ("and", "or", "gt", "lt"):
+            expected = "boolean" if self.op in ("and", "or") else "number"
+            if (self.value is not None or len(self.children) != 2
+                    or any(not isinstance(child, Node) or child.kind != expected for child in self.children)):
+                raise ValueError(f"{self.op} requires two {expected} children")
+        else:
+            raise ValueError(f"Unknown tree operator {self.op!r}")
 
     @property
     def kind(self) -> str:
@@ -145,6 +162,8 @@ class MOO3:
             raise ValueError("population_size must be an integer >=4")
         if type(generations) is not int or generations < 0:
             raise ValueError("generations must be a nonnegative integer")
+        if type(seed) is not int or seed < 0:
+            raise ValueError("seed must be a nonnegative integer")
         if type(max_depth) is not int or max_depth < 1:
             raise ValueError("max_depth must be a positive integer")
         if not np.isfinite(threshold) or not 0 < threshold < 1:
@@ -193,6 +212,27 @@ class MOO3:
         rng = np.random.default_rng(self.seed)
         cache = {}
 
+        def evaluate_many(trees):
+            if self.execution.instrument is None:
+                return [individual(tree) for tree in trees]
+            from ..market_execution import MarketArrays,execute_batch
+            nonlocal prepared_market
+            if prepared_market is None:
+                prepared_market=MarketArrays.from_bars(bars,self.execution.instrument)
+            missing=list(dict.fromkeys(tree for tree in trees if tree not in cache))
+            if missing:
+                decisions=np.column_stack([evaluate_tree(tree,features,len(bars)).astype(np.int8) for tree in missing])
+                outcomes=execute_batch(prepared_market,decisions,self.execution)
+                for i,tree in enumerate(missing):
+                    count=int(outcomes.trade_counts[i])
+                    objectives=(float(outcomes.paper_total_return[i]),
+                                float(outcomes.trade_return_sum[i]/count) if count else 0.,float(outcomes.trade_return_std[i]))
+                    eligible=count>=2 and bool(np.isfinite(objectives).all())
+                    cache[tree]=(objectives if eligible else (-1e12,-1e12,1e12),eligible,count)
+            return [_Individual(tree,*cache[tree]) for tree in trees]
+
+        prepared_market=None
+
         def individual(tree):
             if tree not in cache:
                 signals = evaluate_tree(tree, features, len(bars)).astype(np.int8)
@@ -206,7 +246,7 @@ class MOO3:
             return _Individual(tree, *cache[tree])
 
         coverage = Node("gt", (Node("constant", value=1.0), Node("constant", value=0.0)))
-        population = [individual(coverage)] + [individual(self._tree(rng, names, self.max_depth)) for _ in range(self.population_size - 1)]
+        population = evaluate_many([coverage]+[self._tree(rng,names,self.max_depth) for _ in range(self.population_size-1)])
         history = []
         for generation in range(self.generations + 1):
             fronts = rank_fronts(population)
@@ -219,8 +259,8 @@ class MOO3:
                 left, right = (population[int(i)] for i in rng.integers(len(population), size=2))
                 return min((left, right), key=lambda p: (p.rank, -p.crowding))
 
-            children = [individual(self._offspring(tournament().tree, tournament().tree, rng, names))
-                        for _ in range(self.population_size)]
+            children = evaluate_many([self._offspring(tournament().tree,tournament().tree,rng,names)
+                                      for _ in range(self.population_size)])
             combined = population + children
             survival = []
             for front in rank_fronts(combined):

@@ -28,7 +28,9 @@ PACKAGES = {
     "pydantic": "pydantic", "pandera": "pandera", "matplotlib": "matplotlib",
     "seaborn": "seaborn", "plotly": "plotly", "jupyterlab": "jupyterlab",
     "psycopg": "psycopg", "redis": "redis", "maturin": "maturin",
+    "TA-Lib":"talib", "threadpoolctl":"threadpoolctl",
 }
+CORE_PACKAGES = {"deap", "numpy", "pandas", "scipy", "statsmodels", "arch", "pyarrow", "TA-Lib", "threadpoolctl"}
 
 
 class CheckFailed(RuntimeError):
@@ -40,20 +42,49 @@ def require(condition: bool, message: str) -> None:
         raise CheckFailed(message)
 
 
-def verify_toolchains() -> dict:
-    require(sys.version_info[:2] == (3, 12), "Python 3.12 is required")
+def verify_toolchains(core: bool = False) -> dict:
+    pinned = (Path(__file__).resolve().parents[1] / ".python-version").read_text().strip()
+    require(sys.version.split()[0] == pinned, f"Pinned Python {pinned} is required")
+    if core:
+        return {"python":sys.version.split()[0], "rust":"optional; core profile uses the Python DC backend if native is absent"}
     result = subprocess.run(["rustc", "--version"], check=True, capture_output=True, text=True)
     rust_version = result.stdout.split()[1]
     require(rust_version == "1.90.0", "Rust 1.90.0 is required")
     return {"python": sys.version.split()[0], "rust": rust_version}
 
 
-def verify_packages() -> dict:
+def verify_packages(core: bool = False) -> dict:
     installed = {}
     for distribution, module in PACKAGES.items():
+        if core and distribution not in CORE_PACKAGES:
+            continue
         importlib.import_module(module)
         installed[distribution] = version(distribution)
     return installed
+
+
+def verify_core_computation() -> dict:
+    import numpy as np
+    import pandas as pd
+    from gen_trade.data import ChromosomeContext
+    from gen_trade.runner import compare_methods, synthetic_markets
+
+    markets = synthetic_markets(120, seed=21)
+    with TemporaryDirectory(prefix="gen-trade-core-") as directory:
+        path = Path(directory) / "bars.parquet"
+        markets["BTC/USDT"].to_parquet(path, index=False)
+        pd.testing.assert_frame_equal(pd.read_parquet(path), markets["BTC/USDT"])
+    report = compare_methods(markets, ChromosomeContext("BTC/USDT"), train_bars=65,
+                             validation_bars=0, test_bars=25, population_size=8,
+                             generations=1, workers=3, max_folds=1, bootstrap_reps=100)
+    methods = report["folds"][0]["methods"]
+    require(set(methods) == {"moo3", "mstgam", "igtsp_ring"}, "Three-framework execution failed")
+    require(all(np.isfinite(m["statistics"]["net_total_return"]) for m in methods.values()),
+            "Nonfinite held-out statistics")
+    return {"data":"synthetic dependency checks only", "methods":list(methods),
+            "worker_processes":len({m["worker_pid"] for m in methods.values()}),
+            "checks":["Parquet round-trip", "three spawned-process framework fits and next-open backtests",
+                      "finite net equity statistics", "stationary bootstrap/HAC", "all three paired comparisons"]}
 
 
 def verify_computation() -> dict:
@@ -146,15 +177,16 @@ def verify_services() -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--services", action="store_true", help="Also verify configured PostgreSQL/Redis")
+    parser.add_argument("--core", action="store_true", help="Verify the lean three-framework stack; Rust/research extras optional")
     args = parser.parse_args(argv)
     report = {"status": "checking"}
     stage = "toolchains"
     try:
-        report[stage] = verify_toolchains()
+        report[stage] = verify_toolchains(core=args.core)
         stage = "packages"
-        report[stage] = verify_packages()
+        report[stage] = verify_packages(core=args.core)
         stage = "computation"
-        report[stage] = verify_computation()
+        report[stage] = verify_core_computation() if args.core else verify_computation()
         if args.services:
             stage = "services"
             report[stage] = verify_services()

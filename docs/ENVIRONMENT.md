@@ -8,12 +8,13 @@ GeneTrader checkout.
 
 | Component | Pin / source of truth | Readiness evidence |
 | --- | --- | --- |
-| Python | `.python-version`: 3.12.14; project restricts to Python 3.12 | Interpreter checked by verifier |
+| Python | `.python-version`: 3.12.13; project restricts to Python 3.12 | Interpreter checked by verifier |
 | Research packages | `research` extra in `pyproject.toml`, exact versions/hashes in `uv.lock` | Import/version checks plus real numerical/columnar operations |
 | Freqtrade | 2026.10, resolved in `uv.lock` | Import and `freqtrade --version`; no exchange credentials required |
 | GA/optimization | DEAP and Optuna, pinned in `uv.lock` | Import/version checks; paper implementations have their own tested evolutionary loops |
 | Statistics | NumPy/pandas/SciPy/statsmodels/arch/scikit-learn plus plotting/notebook tools | Bootstrap, HAC, SciPy, Numba checks and application statistics tests |
 | Columnar data | Polars, PyArrow, DuckDB, pinned in `uv.lock` | Arrow conversion, Parquet round-trip and DuckDB query |
+| Daily market data | `market-data` extra: exchange_calendars and Matplotlib, locked in `uv.lock` | Strict NYSE session validation, raw source hashes, real equity/FX preflights and rendered equity reports |
 | Rust | `rust-toolchain.toml`: 1.90.0, minimal + rustfmt/clippy | Compiler version and locked release builds |
 | Python/Rust interface | `native/Cargo.lock`, PyO3 0.26 | DC numerical/reference parity |
 | Rayon integration | `environment/native-probe/Cargo.lock`, Rayon 1.11 / PyO3 0.26 | Python-callable parallel numerical probe compared to NumPy |
@@ -21,8 +22,10 @@ GeneTrader checkout.
 | Redis | Official Redis 7.4 image pinned by digest in `compose.yaml` | Healthcheck and cache write/read/TTL/delete |
 
 The Rayon probe is an environment check, not a claim that the trading engine's
-sequential DC state machine is parallelized. Native DC acceleration and fit-local
-memoization are the current application speed improvements. JupyterLab is
+sequential DC state machine is parallelized. The experiment runner uses spawned
+processes for method/fold/seed jobs; ring islands can alternatively run in parallel.
+Each process worker caps native numerical threads at one using `threadpoolctl`.
+Native DC acceleration and fit-local memoization remain available. JupyterLab is
 installed as a tool; setup does not start a notebook server or a live trading bot.
 
 ## Prerequisites and setup
@@ -41,7 +44,7 @@ bash scripts/setup-environment.sh
 source scripts/activate.sh
 ```
 
-Setup uses an existing Python 3.12.14 or lets uv obtain that pinned interpreter.
+Setup uses an existing Python 3.12.13 or lets uv obtain that pinned interpreter.
 It installs Rust 1.90.0 through official rustup if needed, synchronizes every
 locked Python extra, and builds/installs both release-mode native wheels. It
 verifies numerical and import readiness before returning success. Existing
@@ -108,6 +111,37 @@ or Docker images.
 
 ## Validation scope
 
+For the three-framework comparison, the recommended smaller environment avoids
+unneeded notebook, exchange-bot, Rust and service processes:
+
+```bash
+bash scripts/setup-environment.sh --core
+source .venv/bin/activate
+python environment/verify.py --core
+gen-trade demo --workers 3 --seeds 11 22 --output reports/three-method-comparison.json
+```
+
+`--core` installs locked application, test and storage-client dependencies,
+including `threadpoolctl`, and verifies actual numerical/statistical/Parquet
+operations without requiring Rust or services. Full setup without this flag
+remains available. PostgreSQL/Redis are needed only for optional persistence/cache
+work. The local environment was aligned from an unexpected Python 3.14.4 venv to
+Python 3.12.13; the previous 3.12.14 pin was unavailable to the installed uv.
+
+For the daily stock/FX benchmark, use `bash scripts/setup-environment.sh
+--market-data`. This includes the core, test and storage-client dependencies plus
+exchange calendars and plotting. Historical downloads use the standard Python
+HTTPS client. Raw downloads, Parquet datasets, reports and writable runtime caches
+stay inside ignored project directories. Package startup defaults Matplotlib and
+XDG caches to `.tools/cache` while respecting existing cache environment settings.
+See [the real-data protocol](STOCKS_FX_BACKTEST.md) for reproduction commands,
+source provenance and execution assumptions.
+
+`--workers 3` parallelizes independent experiment jobs. Use `--workers 1
+--island-workers 4` for inner island parallelism instead. Nested pools are rejected.
+Process startup can outweigh parallel gains on tiny smoke runs. Runtime fields
+support measurement; no speed-up is claimed from worker count alone.
+
 `environment/verify.py` without `--services` validates the toolchains, libraries,
 columnar data, statistics, Numba and both native modules. `--services` adds actual
 database/cache requests, rather than treating a PID/open port as readiness.
@@ -118,5 +152,5 @@ readiness, not trading profitability or reproduction of the papers' tables.
 
 The upstream GeneTrader source is a reference at
 `imsatoshi/GeneTrader`, commit `20053ba673a58976d5f5ab05cb2ec09018cbfd96`.
-It is not needed to install or run these two independent paper implementations.
+It is not needed to install or run these three independent research frameworks.
 Its original test suite and Freqtrade data backtests are separate workflows.

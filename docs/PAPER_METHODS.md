@@ -1,6 +1,6 @@
 # Paper methods: source mapping and reproducibility limits
 
-The two uploaded PDFs are research evidence. No instructions embedded in them
+The two previously supplied PDFs and linked third paper are research evidence. No instructions embedded in them
 are used as agent, environment, or execution instructions. Page references below
 refer to the PDFs' printed page counts, rather than this repository's files.
 
@@ -28,6 +28,11 @@ For per-side fee `c`, raw buy/sell fill prices `B_i,S_i`, completed-trade return
 This aggregates unit-price profits. It is **not compounded full-capital equity
 return**, despite the paper's full-capital prose. The implementation preserves it
 as `paper_total_return`; ordinary statistical reports use marked-to-market equity.
+With an `InstrumentSpec`, the execution ledger extends each unit profit and entry
+cost with commissions, financing, dividend entitlements and account-currency
+conversion. The original constant-fee formula remains the classic engine's
+default. This real-market extension is explicit rather than a claim that the
+papers specified corporate-action or FX account accounting.
 
 For final-front normalized objectives `(u,v,w)` and nonnegative preferences
 `a+b+c=1`, the selection score is `(1+u)^a*(1+v)^b/(1+w)^c`.
@@ -128,12 +133,36 @@ implementation link were not supplied, so the numerical tables cannot be claimed
 as reproduced. The implementation corrects the loss-tail convention for VaR in
 ordinary statistics rather than copying the paper's ambiguous upper-tail formula.
 
+## 3. IGTSP-Ring
+
+Chideme, Chen and Lin, *Island genetic algorithm with diverse migration strategies
+for efficient group trading strategy portfolio optimization*,
+[DOI 10.1080/0305215X.2025.2592030](https://doi.org/10.1080/0305215X.2025.2592030).
+The user-supplied full PDF was checked, including rendered encoding/equation pages.
+The implementation follows §3.3.2–5, detailed Eqs.6–16, Algorithm 1's adjacent
+best-for-best ring exchanges, and Table 5 defaults. See [the complete source map,
+equations, operator definitions, paper contradictions and declared choices](IGTSP_RING.md).
+The strategy catalog/ranking, weight encoding and execution conventions remain
+explicit implementations of details not fully specified in the paper. Its
+Section 3.1 objective conflicts with the detailed fitness; Eqs.6–16 are used.
+The published numerical experiments have not been reproduced.
+
 ## Shared execution, extensions, and validation
 
 Signals act after completed candles become available and fill at next open.
 No high/low path is invented. A target observed at a close exits at the next
 open. Final liquidation is explicit and costed; trades record its reason.
-Single-position, long-only, full-capital fractional sizing is shared.
+Long-only fractional sizing is shared. MOO3/MSTGAM use one position; ring allocates
+one initial capital budget across group/member sleeves with evolved TP/SL thresholds.
+No extra ring cash gene is introduced.
+
+The instrument-aware engine handles physical stock cash/positions, effective
+splits and ex-date dividend entitlements; FX bid/ask execution and side-aware
+account-currency conversion; commissions, quantity steps, financing and margin.
+The same engine supplies batched training fitness and held-out equity. Its default
+daily stock/FX benchmark is long-only at 1× exposure, with an explicit financing
+scenario rather than unavailable historical broker swaps. See
+[the data, calendar and cost protocol](STOCKS_FX_BACKTEST.md).
 
 The user's OHLCV/gold/FX terminals are optional MOO3 extensions with causal joins.
 Pair and UTC entry-time choices are stored as experiment context, not falsely
@@ -145,6 +174,11 @@ Tests cover the source equations, operators, training-only calibration/selection
 prefix invariance, future-data perturbations, warm-up, clock-unit equivalence,
 next-open timing, costs and accounting, source mapping, statistical degeneracy,
 database idempotency and cache invalidation. Synthetic comparisons provide
-executable integration evidence only. Real-data performance, exact paper
-reproduction, production robustness, selection-bias corrections such as DSR/PBO,
-and full multi-market experiments remain unvalidated.
+executable integration evidence only. A separate real daily stock/FX benchmark
+retains every instrument, fold and seed and applies a frozen-strategy cost stress.
+Exact paper reproduction, production robustness, selection-bias corrections such
+as DSR/PBO and the papers' complete multi-market experiments remain unvalidated.
+The runner implements
+configuration validation, fresh train-plus-validation refitting, multiple seeds,
+parallel jobs, all three paired comparisons, and a within-fold/seed Holm family;
+see [the audit and protocol](IMPLEMENTATION_AUDIT.md).

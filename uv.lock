@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -621,6 +621,23 @@ wheels = [
 ]
 
 [[package]]
+name = "exchange-calendars"
+version = "4.13.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "korean-lunar-calendar" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pyluach" },
+    { name = "toolz" },
+    { name = "tzdata" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/47/73/460b0ece4e7444e3098b7738974c822787e134578d069d3a88b4be17d50a/exchange_calendars-4.13.2.tar.gz", hash = "sha256:a9459425dd64142cd54fbc639847403c7e0c33d60fbc326c94fc1d6bd127f002", size = 4137321, upload-time = "2026-03-10T03:24:38.536Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/4c/0469b40057bc9f8d9594dcc6024202626b981ae4b52dfcd304552e8e1c3a/exchange_calendars-4.13.2-py3-none-any.whl", hash = "sha256:fc5a2ad0d61b5c3a6539a3061cd4cbb55c59f4a903455cec7926e4b798919996", size = 213306, upload-time = "2026-03-10T03:24:37.055Z" },
+]
+
+[[package]]
 name = "executing"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -824,7 +841,7 @@ wheels = [
 
 [[package]]
 name = "gen-trade"
-version = "0.1.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "arch" },
@@ -835,6 +852,7 @@ dependencies = [
     { name = "scipy" },
     { name = "statsmodels" },
     { name = "ta-lib" },
+    { name = "threadpoolctl" },
 ]
 
 [package.optional-dependencies]
@@ -842,6 +860,10 @@ dev = [
     { name = "hypothesis" },
     { name = "maturin" },
     { name = "pytest" },
+]
+market-data = [
+    { name = "exchange-calendars" },
+    { name = "matplotlib" },
 ]
 research = [
     { name = "beautifulsoup4" },
@@ -877,11 +899,13 @@ requires-dist = [
     { name = "black", marker = "extra == 'research'", specifier = ">=24" },
     { name = "deap", specifier = ">=1.4" },
     { name = "duckdb", marker = "extra == 'research'", specifier = ">=1" },
+    { name = "exchange-calendars", marker = "extra == 'market-data'", specifier = ">=4.11" },
     { name = "flake8", marker = "extra == 'research'", specifier = ">=7" },
     { name = "freqtrade", marker = "extra == 'research'", specifier = "==2026.10" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6" },
     { name = "jupyterlab", marker = "extra == 'research'", specifier = ">=4" },
     { name = "loguru", marker = "extra == 'research'", specifier = ">=0.7" },
+    { name = "matplotlib", marker = "extra == 'market-data'", specifier = ">=3.10" },
     { name = "matplotlib", marker = "extra == 'research'", specifier = ">=3.8" },
     { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.9" },
     { name = "numba", marker = "extra == 'research'", specifier = ">=0.59" },
@@ -905,8 +929,9 @@ requires-dist = [
     { name = "sqlalchemy", marker = "extra == 'research'", specifier = ">=2" },
     { name = "statsmodels", specifier = ">=0.14" },
     { name = "ta-lib", specifier = ">=0.6" },
+    { name = "threadpoolctl", specifier = ">=3.5" },
 ]
-provides-extras = ["dev", "storage", "research"]
+provides-extras = ["dev", "storage", "market-data", "research"]
 
 [[package]]
 name = "h11"
@@ -1402,6 +1427,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a9/c4/1407df7512a5b36cc79840e01710dc575733c461b13ab866cae77eaf87f3/kiwisolver-1.5.1-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:482676e5bd48d70ac99d9fc78863469845421e01184fa83f1f9366dc49f7e974", size = 134002, upload-time = "2026-08-28T10:28:08.881Z" },
     { url = "https://files.pythonhosted.org/packages/16/45/c37a21ad5c0ab581a93c55ad544721aaa1f0ae94edb29c6a678a23d013e6/kiwisolver-1.5.1-graalpy312-graalpy250_312_native-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:072bdb15a3c19a5b5dbc8f8fb1f4e1884bf4f3507eeb4cc6334401274d37a5c0", size = 194292, upload-time = "2026-08-28T10:28:11.06Z" },
     { url = "https://files.pythonhosted.org/packages/a6/c1/69f00d627949580e43d57af0aa465df46868d7c29801c137a55374101294/kiwisolver-1.5.1-graalpy312-graalpy250_312_native-win_amd64.whl", hash = "sha256:a5a00665d1a0e26763a7338d7e911d4598fbc1d50dd0d6b7919b7dc6c5d6569f", size = 73362, upload-time = "2026-08-28T10:28:12.449Z" },
+]
+
+[[package]]
+name = "korean-lunar-calendar"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/9f/6160e95f3934026194dc7a0b5c78fe5c6e74761830ddea3e9cfc38e3f983/korean_lunar_calendar-0.4.0.tar.gz", hash = "sha256:be56f27bc0594fdbbdf7bbe00f504a9f929a31e311bd7d9bb93561b645afade7", size = 13425, upload-time = "2026-06-15T14:19:57.163Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/88/f56033b09fdca5c8c5e5fc2f3513950a05cd62caa9bd8e6d2750a887c86e/korean_lunar_calendar-0.4.0-py3-none-any.whl", hash = "sha256:c042e20de0bb702add6bec8d0f6da1ea8d3b170838e63846f70420cf341fe4e7", size = 11323, upload-time = "2026-06-15T14:19:56.089Z" },
 ]
 
 [[package]]
@@ -1911,7 +1945,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess" },
+    { name = "ptyprocess", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -2255,6 +2289,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/43/ea/5194e52748b0da83d71e082d75496eaec6e58f419f5e184786ded517e6a9/pyjwt-2.15.1.tar.gz", hash = "sha256:4f259e80cdfb6b3fc18a7de51fd1ef9ec79652f25019bae68975ca2468a34df8", size = 121252, upload-time = "2026-09-28T18:40:42.598Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/50/ca/44de4e75f8aadc457f0634be3b542815078ded46dca30efb960edeecad6e/pyjwt-2.15.1-py3-none-any.whl", hash = "sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193", size = 33860, upload-time = "2026-09-28T18:40:41.429Z" },
+]
+
+[[package]]
+name = "pyluach"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/11/11/42568c1568a75f8803c59f26d29af01a0890352b7a8e03d41ecda8bfb5dd/pyluach-2.3.0.tar.gz", hash = "sha256:ec6e30669d1df50c9ca160486da44a8195bb4c7a5d3d533990d0c5b03accd281", size = 26910, upload-time = "2025-09-09T20:24:39.651Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/c8/f96208ade3ca4c23b372497d0788bcf0f2e0ff4310e5ee693366bc33fdf0/pyluach-2.3.0-py3-none-any.whl", hash = "sha256:4497b731aef59508b079dbf5f00bc5bf4329ac45090a6cd37b5a83756f0e69ab", size = 25914, upload-time = "2025-09-09T20:24:37.831Z" },
 ]
 
 [[package]]
@@ -2815,6 +2858,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a3/ae/2ca4913e5c0f09781d75482874c3a95db9105462a92ddd303c7d285d3df2/tinycss2-1.5.1.tar.gz", hash = "sha256:d339d2b616ba90ccce58da8495a78f46e55d4d25f9fd71dfd526f07e7d53f957", size = 88195, upload-time = "2025-11-23T10:29:10.082Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/45/c7b5c3168458db837e8ceab06dc77824e18202679d0463f0e8f002143a97/tinycss2-1.5.1-py3-none-any.whl", hash = "sha256:3415ba0f5839c062696996998176c4a3751d18b7edaaeeb658c9ce21ec150661", size = 28404, upload-time = "2025-11-23T10:29:08.676Z" },
+]
+
+[[package]]
+name = "toolz"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/31/6f/ae20c212a07aa2d156c787383d8088a5e045ee39628661edb190c97e1659/toolz-1.2.0.tar.gz", hash = "sha256:9667a038e9d6ecba37995e26cb2f59ec6420b6ad8dd9677de59db9b956b08490", size = 55442, upload-time = "2026-10-07T04:16:25.639Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/db/17/4c8beb6c8c4176c6bf143bfd7e1e4dd6719b00ced90738c7ac471b71c1df/toolz-1.2.0-py3-none-any.whl", hash = "sha256:890f820b1cb8152785aaf9386d8707770110809035800985ca65cb24ce1120ef", size = 60789, upload-time = "2026-10-07T04:16:24.173Z" },
 ]
 
 [[package]]

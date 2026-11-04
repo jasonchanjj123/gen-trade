@@ -13,6 +13,24 @@ from .runner import compare_methods, synthetic_markets
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    fetch=commands.add_parser('fetch-data',help='Download and audit the approved daily stock/FX histories')
+    fetch.add_argument('--directory',type=Path,default=Path('data/stocks-fx-2015-2025'))
+    fetch.add_argument('--start',default='2015-01-01')
+    fetch.add_argument('--end',default='2026-01-01',help='Exclusive end date')
+    fetch.add_argument('--refresh',action='store_true')
+    benchmark=commands.add_parser('benchmark',help='Run all three methods on calendar-year stock/FX folds')
+    benchmark.add_argument('--data-directory',type=Path,default=Path('data/stocks-fx-2015-2025'))
+    benchmark.add_argument('--output',type=Path,default=Path('reports/stocks-fx-2015-2025'))
+    benchmark.add_argument('--population',type=int,default=64)
+    benchmark.add_argument('--generations',type=int,default=20)
+    benchmark.add_argument('--seeds',type=int,nargs='+',default=[11,22,33])
+    benchmark.add_argument('--workers',type=int,default=3)
+    benchmark.add_argument('--bootstrap-reps',type=int,default=500)
+    benchmark.add_argument('--first-test-year',type=int,default=2019)
+    benchmark.add_argument('--last-test-year',type=int,default=2025)
+    benchmark.add_argument('--embargo-bars',type=int,default=5)
+    benchmark.add_argument('--symbols',nargs='+',help='Optional subset of the downloaded universe')
+    benchmark.add_argument('--no-resume',action='store_true')
     for command in ("demo", "compare"):
         p = commands.add_parser(command)
         if command == "compare":
@@ -27,10 +45,15 @@ def main(argv=None) -> int:
         p.add_argument("--population",type=int,default=16)
         p.add_argument("--generations",type=int,default=2)
         p.add_argument("--train-bars",type=int,default=240)
+        p.add_argument("--validation-bars",type=int,default=60,help="Separate configuration selection window; 0 requires one fixed config per method")
         p.add_argument("--test-bars",type=int,default=80)
         p.add_argument("--embargo-bars",type=int,default=5)
         p.add_argument("--folds",type=int,default=2)
         p.add_argument("--seed",type=int,default=42)
+        p.add_argument("--seeds",type=int,nargs="+",help="Run every method for every seed; no held-out seed selection")
+        p.add_argument("--workers",type=int,default=3,help="Independent method/fold/seed processes; 1 for serial")
+        p.add_argument("--island-workers",type=int,default=1,help="Parallel ring islands; requires --workers 1")
+        p.add_argument("--method-configs",type=Path,help="JSON mapping method names to lists of validation candidate settings")
         p.add_argument("--fee",type=float,default=.0025,help="Common fractional per-side fee for comparison")
         p.add_argument("--slippage-bps",type=float,default=0.)
         p.add_argument("--bootstrap-reps",type=int,default=300)
@@ -38,13 +61,28 @@ def main(argv=None) -> int:
         p.add_argument("--persist",action="store_true",help="Also save to PostgreSQL using DATABASE_URL")
         p.add_argument("--experiment-id",help="Required with --persist; immutable result ID")
     args = parser.parse_args(argv)
-    if args.persist and not args.experiment_id:
+    if getattr(args,'persist',False) and not args.experiment_id:
         parser.error("--persist requires --experiment-id")
     try:
+        if args.command=='fetch-data':
+            from .market_data import fetch_dataset
+            manifest=fetch_dataset(args.directory,start=args.start,end=args.end,refresh=args.refresh)
+            print(f"Verified {len(manifest['universe'])} instruments in {args.directory}")
+            return 0
+        if args.command=='benchmark':
+            from .benchmark import run_benchmark
+            run_benchmark(args.data_directory,args.output,population_size=args.population,generations=args.generations,
+                          seeds=tuple(args.seeds),workers=args.workers,first_test_year=args.first_test_year,
+                          last_test_year=args.last_test_year,embargo_bars=args.embargo_bars,bootstrap_reps=args.bootstrap_reps,
+                          resume=not args.no_resume,symbols=args.symbols)
+            return 0
         markets = synthetic_markets(args.bars,args.seed) if args.command == "demo" else read_market_data(args.data)
         genes = tuple(FeatureGene(source,lag=1,max_age="4D") for source in ("XAU/USD","EUR/USD")) if args.cross_market_features else ()
         context = ChromosomeContext(args.pair,tuple(args.entry_hours) if args.entry_hours else None,genes)
         report = compare_methods(markets,context,train_bars=args.train_bars,test_bars=args.test_bars,
+                                 validation_bars=args.validation_bars,workers=args.workers,island_workers=args.island_workers,
+                                 seeds=tuple(args.seeds) if args.seeds else None,
+                                 method_configs=json.loads(args.method_configs.read_text()) if args.method_configs else None,
                                  embargo_bars=args.embargo_bars,max_folds=args.folds,
                                  population_size=args.population,generations=args.generations,
                                  seed=args.seed,fee=args.fee,slippage_bps=args.slippage_bps,
@@ -57,11 +95,11 @@ def main(argv=None) -> int:
             import os
             from .storage import PostgresStore
             PostgresStore(os.environ["DATABASE_URL"]).save_report(report,args.experiment_id)
-        print(f"Saved {len(report['folds'])} chronological fold(s) to {args.output}")
+        print(f"Saved {len(report['folds'])} chronological fold/seed run(s), 3 methods each, to {args.output}")
         if args.command == "demo":
             print("Synthetic data only; this is a software validation, not evidence of trading performance.")
         return 0
-    except (ValueError,KeyError,RuntimeError) as exc:
+    except (ValueError,KeyError,RuntimeError,OSError,TypeError) as exc:
         print(f"Experiment failed: {exc}",file=sys.stderr)
         return 2
 

@@ -153,3 +153,28 @@ def test_no_trade_and_one_trade_samples_fail_clearly():
     midday_only = ExecutionConfig(fee=.00025, max_holding_days=5, entry_hours=(12,))
     with pytest.raises(ValueError, match="two completed trades"):
         MOO3(population_size=4, generations=1, execution=midday_only).fit(candles(30))
+
+
+def test_tree_chromosome_rejects_invalid_types_constants_and_arity():
+    number = Node("constant", value=.5)
+    boolean = Node("gt", (number, number))
+    for constructor in (
+        lambda: Node("unknown"), lambda: Node("constant", value=np.nan),
+        lambda: Node("constant", value=-.1), lambda: Node("feature", value=""),
+        lambda: Node("gt", (boolean, number)), lambda: Node("and", (boolean,)),
+    ):
+        with pytest.raises(ValueError):
+            constructor()
+
+
+def test_typed_variation_preserves_depth_and_valid_grammar_across_many_parents():
+    model = MOO3(population_size=4, generations=0, max_depth=4)
+    rng = np.random.default_rng(31)
+    names = ("x", "y", "z")
+    first = model._tree(rng, names, model.max_depth)
+    for _ in range(200):
+        second = model._tree(rng, names, model.max_depth)
+        first = model._offspring(first, second, rng, names)
+        assert first.kind == "boolean"
+        assert first.depth <= 4
+        assert evaluate_tree(first, {name:np.array([0, .5, 1.]) for name in names}, 3).dtype == bool

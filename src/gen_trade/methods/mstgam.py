@@ -228,6 +228,8 @@ class MSTGAM:
         return elapsed_seconds, times_ns
 
     def _score(self, frame: pd.DataFrame, signals: np.ndarray) -> tuple[float, int]:
+        if self.execution.instrument is not None:
+            return self._score_many(frame,np.asarray(signals)[None,:])[0]
         key = np.asarray(signals, dtype=np.int8).tobytes()
         if key not in self._fitness_cache:
             result = run_backtest(frame, signals, self.execution)
@@ -236,6 +238,22 @@ class MSTGAM:
         else:
             self._cache_hits += 1
         return self._fitness_cache[key]
+
+    def _score_many(self,frame,signals):
+        if self.execution.instrument is None:
+            return [self._score(frame,signal) for signal in signals]
+        from ..market_execution import execute_batch
+        keys=[np.asarray(signal,dtype=np.int8).tobytes() for signal in signals]
+        missing={key:signal for key,signal in zip(keys,signals) if key not in self._fitness_cache}
+        if missing:
+            result=execute_batch(self._prepared_market,np.column_stack(list(missing.values())),self.execution)
+            for i,key in enumerate(missing):
+                count=int(result.trade_counts[i]); std=float(result.trade_return_std[i])
+                score=(result.trade_return_sum[i]-self.risk_free_return)/std if count>=2 and std>1e-12 else INVALID_FITNESS
+                score=float(np.clip(score,-1e9,1e9)) if score!=INVALID_FITNESS and np.isfinite(score) else INVALID_FITNESS
+                self._fitness_cache[key]=(score,count)
+        self._cache_hits+=len(keys)-len(missing)
+        return [self._fitness_cache[key] for key in keys]
 
     def _cutoffs(self, frame: pd.DataFrame, f: _Features, values: np.ndarray) -> tuple[float | None, float | None]:
         candidates = []
@@ -249,11 +267,11 @@ class MSTGAM:
                                              for part in np.array_split(np.sort(observed), 4) if len(part))))
         best = (candidates[0][0], candidates[1][0])
         best_score = INVALID_FITNESS
-        for down in candidates[0]:
-            for up in candidates[1]:
-                score, _ = self._score(frame, _threshold_signal(f, values, down, up))
-                if score > best_score:
-                    best, best_score = (down, up), score
+        pairs=[(down,up) for down in candidates[0] for up in candidates[1]]
+        signals=[_threshold_signal(f,values,down,up) for down,up in pairs]
+        for pair,(score,_) in zip(pairs,self._score_many(frame,signals)):
+            if score>best_score:
+                best,best_score=pair,score
         return best
 
     def _calibrate(self, frame: pd.DataFrame, features: list[_Features], times: np.ndarray) -> list[ThresholdCalibration]:
@@ -295,13 +313,17 @@ class MSTGAM:
         return np.column_stack([per_threshold[index][:, strategy - 1] for strategy, index in GENES])
 
     def fit(self, bars: pd.DataFrame, extra_features=None) -> MSTGAM:
+        self._fitted = False
+        self._diagnostics = {}
         frame = validate_bars(bars)
         if len(frame) < 3:
             raise ValueError("MSTGAM training needs at least three candles")
         ignored = self._external_names(extra_features, len(frame))
-        self._fitted = False
         self._fitness_cache: dict[bytes, tuple[float, int]] = {}
         self._cache_hits = 0
+        if self.execution.instrument is not None:
+            from ..market_execution import MarketArrays
+            self._prepared_market=MarketArrays.from_bars(frame,self.execution.instrument)
         times, times_ns = self._clock(frame)
         prices = frame["close"].to_numpy()
         features = [_profile_features(prices, times, theta) for theta in THRESHOLDS]
@@ -318,7 +340,7 @@ class MSTGAM:
             # Batch all votes, then reuse simulator results for identical actions.
             buy, sell, hold = population @ buy_mask, population @ sell_mask, population @ hold_mask
             all_signals = _vote_totals(buy, sell, hold, active)
-            evaluations = [self._score(frame, signal) for signal in all_signals]
+            evaluations = self._score_many(frame,all_signals)
             scores = np.asarray([value[0] for value in evaluations])
             elite_index = int(np.argmax(scores))
             if scores[elite_index] > best_score:
@@ -359,6 +381,8 @@ class MSTGAM:
         self._fitted = True
         # Fitness cache is fit-local, not an unbounded process-level market cache.
         self._fitness_cache.clear()
+        if hasattr(self,"_prepared_market"):
+            del self._prepared_market
         return self
 
     def predict(self, bars: pd.DataFrame, extra_features=None) -> np.ndarray:
