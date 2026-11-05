@@ -359,3 +359,42 @@ def test_cadence_profiles_replace_the_inert_mstgam_knob():
         assert all("min_votes" not in c and c["min_trades_per_year"] == floor for c in profile["mstgam"])
         assert all(c["min_trades_per_year"] == floor for c in profile["moo3"])
     assert set(CANDIDATE_PROFILES) >= {"robust_weekly", "robust_monthly"}
+
+
+from gen_trade.statistics import random_aligned_signals
+
+
+def test_decision_bars_respect_the_bar_before_the_window():
+    times = pd.bdate_range("2024-01-03", periods=10, tz="UTC")  # starts on a Wednesday
+    assert decision_bars(times, "weekly")[0]
+    assert not decision_bars(times, "weekly", previous=pd.Timestamp("2024-01-02", tz="UTC"))[0]
+    assert decision_bars(times, "weekly", previous=pd.Timestamp("2023-12-29", tz="UTC"))[0]
+
+
+def test_aligned_placements_enter_only_after_decision_bars_and_keep_lengths():
+    bars = candles(260, start="2024-01-01")
+    decision = decision_bars(bars["timestamp"], "monthly")
+    signal = apply_cadence(np.where(np.arange(len(bars)) % 37 < 18, 1, -1).astype(np.int8), bars["timestamp"], "monthly")
+    actual = run_market_backtest(bars, signal, execution())
+    placed = random_aligned_signals(actual.trades, len(bars), 60, np.random.default_rng(3), decision)
+    assert placed is not None
+    entries = np.argwhere(placed == 1)[:, 0]
+    assert decision[entries].all()
+    kept = sorted(t.exit_index - t.entry_index for t in actual.trades if not t.forced_at_end)
+    for rep in range(placed.shape[1]):
+        replay = run_market_backtest(bars, placed[:, rep], execution())
+        assert len(replay.trades) == len(actual.trades)
+        exits = [t for t in replay.trades if not t.forced_at_end]
+        assert all(decision[t.exit_index - 1] for t in exits)  # monthly exits stay on decision bars
+        periods = lambda ts: sorted(int(np.sum(decision[t.entry_index - 1:t.exit_index - 1])) for t in ts)
+        assert periods(exits) == periods([t for t in actual.trades if not t.forced_at_end])
+    assert kept  # the fixture has completed trades
+
+
+def test_random_timing_uses_aligned_placements_when_given_a_cadence():
+    bars = candles(260, start="2024-01-01")
+    decision = decision_bars(bars["timestamp"], "weekly")
+    signal = apply_cadence(np.where(np.arange(len(bars)) % 11 < 5, 1, -1).astype(np.int8), bars["timestamp"], "weekly")
+    result = run_market_backtest(bars, signal, execution())
+    timing, note = random_timing(result, bars, execution(), reps=30, seed=2, decision=decision)
+    assert note is None and timing["construction"].endswith("decision bars")

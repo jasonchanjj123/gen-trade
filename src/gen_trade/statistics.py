@@ -382,6 +382,55 @@ def random_interval_signals(trades, periods: int, reps: int, rng: np.random.Gene
     return signals
 
 
+def random_aligned_signals(trades, periods: int, reps: int, rng: np.random.Generator,
+                           decision: np.ndarray) -> np.ndarray | None:
+    """EXTENSION: random placements that respect a weekly/monthly decision cadence.
+
+    Entries happen only at the open after a decision bar, as the strategy's do.
+    A trade whose entry and exit both followed decision bars keeps its length in
+    decision periods (so it also exits after a decision bar); any other trade
+    (profit target, stop, deadline, sample end) keeps its length in bars. Each
+    trade blocks the decision points it spans, and blocks are placed with
+    uniformly random gaps on the decision-point line. Returns n-by-reps signals.
+    """
+    if not trades:
+        return None
+    points = np.flatnonzero(np.asarray(decision, dtype=bool)[:max(periods - 1, 0)])
+    if not len(points):
+        return None
+    where = {int(d):i for i, d in enumerate(points)}
+    def bars_span(length):
+        ends = np.searchsorted(points, points + length, side="right")
+        return int(np.max(ends - np.arange(len(points))))
+    specs = []
+    for trade in trades:
+        entry, exit_ = int(trade.entry_index), int(trade.exit_index)
+        if not trade.forced_at_end and entry - 1 in where and exit_ - 1 in where and exit_ > entry:
+            k = where[exit_ - 1] - where[entry - 1]
+            specs.append(("periods", k, k + 1))
+        else:
+            length = max(1, exit_ - entry)
+            specs.append(("bars", length, bars_span(length)))
+    free = len(points) - sum(s[2] for s in specs)
+    if free < 0:
+        return None
+    signals = np.zeros((periods, reps), dtype=np.int8)
+    for rep in range(reps):
+        order = rng.permutation(len(specs))
+        gaps = np.diff(np.concatenate([[0], np.sort(rng.integers(0, free + 1, size=len(specs)))]))
+        j = 0
+        for gap, index in zip(gaps, order):
+            kind, length, span = specs[index]
+            j += int(gap)
+            entry = int(points[j]) + 1
+            exit_ = int(points[j + length]) + 1 if kind == "periods" else entry + length
+            signals[entry - 1, rep] = 1
+            if exit_ - 1 < periods - 1:
+                signals[exit_ - 1, rep] = -1
+            j += span
+    return signals
+
+
 def probabilistic_sharpe_ratio(returns: np.ndarray, benchmark_sharpe: float = 0.0) -> float | None:
     """PSR of Bailey and Lopez de Prado: P(true per-period SR > benchmark)."""
     from scipy.stats import norm, skew, kurtosis

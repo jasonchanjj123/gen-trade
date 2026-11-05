@@ -204,9 +204,15 @@ gen-trade benchmark --protocol audited2 --method-profile robust_weekly --output 
 gen-trade benchmark --protocol audited2 --method-profile robust_monthly --output reports/audited2-robust-monthly
 ```
 
-Known limits: the random-timing null still places trades on any bar, not only
-after decision bars, so a calendar effect of the cadence counts as timing; the
-Ring haircut covers the GA search inside the final 34-rule bank, not the bank's
+Random timing is cadence-aligned for weekly and monthly methods (follow-up
+commit): random entries happen only after the method's decision bars, trades
+that exited after a decision bar keep their length in decision periods, and the
+others keep their length in bars (`statistics.random_aligned_signals`).
+Finished reports can be corrected with `gen-trade reanalyze SRC --output DST
+--data-directory D --aligned-timing`. Ring sleeves with more trades than free
+decision points get no control (undefined).
+
+Known limits: the Ring haircut covers the GA search inside the final 34-rule bank, not the bank's
 selection from the 1,764-rule pool; monthly decisions leave few validation-year
 trades, so expect more configurations to fail the two-trade validation rule.
 `lockbox.json` was re-frozen to include both profiles (lockbox untouched).

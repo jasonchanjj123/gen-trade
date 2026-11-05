@@ -416,7 +416,9 @@ def _render_report(directory,summary,paths):
                 return float(np.median(values)) if values else None
             lines.append(f"| {symbol} | {name} | {percent(median('net_total_return'))} | {percent(median('annualized_return'))} | {number(median('sharpe'))} | {percent(median('max_drawdown'))} | {percent(median('net_total_return',True))} | {sum(r['cash_fallback_folds'] for r in rows)} |")
     if summary.get('reanalysis'):
-        lines[2:2]=[f"Reanalysis of `{summary['reanalysis']['source_directory']}` with the current statistics; per-asset reports unchanged, no strategy refitted. Ring random timing added post hoc for {summary['reanalysis']['posthoc_ring_random_timing_folds']} fold-seed runs.",'']
+        aligned=summary['reanalysis'].get('posthoc_aligned_random_timing_runs',0)
+        lines[2:2]=[f"Reanalysis of `{summary['reanalysis']['source_directory']}` with the current statistics; per-asset reports unchanged, no strategy refitted. Ring random timing added post hoc for {summary['reanalysis']['posthoc_ring_random_timing_folds']} fold-seed runs"
+                    +(f"; random timing recomputed with cadence-aligned placements for {aligned} method runs." if aligned else "."),'']
     settings=summary['settings']
     extended=settings.get('protocol','original')!='original' or settings.get('method_profile','paper')!='paper'
     if extended:
@@ -621,16 +623,20 @@ def _result_from(path,execution):
                           execution,tuple(pd.to_datetime(path['timestamps'],utc=True)))
 
 
-def posthoc_ring_timing(reports,data_directory,settings,manifest,reps=200):
-    """EXTENSION: fill Ring random-timing controls missing from finished reports.
+def posthoc_timing(reports,data_directory,settings,manifest,reps=200,aligned=False):
+    """EXTENSION: fill or correct random-timing controls in finished reports.
 
-    Rebuilds each fold's test window from the same dataset (hash checked) and
-    protocol, and refuses unless next-open buy-and-hold on that window
-    reproduces the stored baseline equity. Only stored trades are used; no
-    strategy is refitted or re-predicted.
+    Adds Ring's missing controls and, with ``aligned``, recomputes the control
+    of every method that decided weekly or monthly with entries restricted to
+    its decision points (the earlier value is kept as
+    ``random_timing_unaligned``). Each fold's test window is rebuilt from the
+    same dataset (hash checked) and protocol, and the run is refused unless
+    next-open buy-and-hold on it reproduces the stored baseline equity. Only
+    stored trades are used; no strategy is refitted or re-predicted.
     """
     from dataclasses import replace
     from .backtest import run_backtest
+    from .methods.cadence import decision_bars
     from .runner import random_timing
     markets,data_manifest=load_dataset(data_directory)
     rules=settings.get('protocol_rules') or PROTOCOLS[settings.get('protocol','original')]
@@ -642,28 +648,47 @@ def posthoc_ring_timing(reports,data_directory,settings,manifest,reps=200):
         if rules.get('merge_fx_weekend_stubs') and '/' in symbol:
             frame,_=merge_fx_weekend_stubs(frame)
         for fold in report['folds']:
-            controls=fold.get('exposure_controls',{}).get('igtsp_ring')
-            if controls is None or controls.get('random_timing') is not None:
+            if 'exposure_controls' not in fold:
                 continue
             bounds=fold['bounds']
             test=frame.iloc[bounds['test_start']:bounds['test_stop']].reset_index(drop=True)
-            method=fold['methods']['igtsp_ring']
-            execution=_execution_from(method['parameters']['execution'])
-            plain=replace(execution,take_profit=None,stop_loss=None,max_holding_days=None)
-            baseline=run_backtest(test,np.ones(len(test),dtype=np.int8),plain)
-            stored=np.asarray(fold['baseline_backtest']['equity'],dtype=float)
-            if baseline.equity.shape!=stored.shape or not np.allclose(baseline.equity,stored,rtol=1e-10,atol=1e-6):
-                raise ValueError(f'{symbol} fold {fold["index"]}: reconstructed test window does not reproduce the stored baseline')
-            timing,note=random_timing(_result_from(method['backtest'],execution),test,execution,reps=reps,
-                                      seed=int(fold['effective_seed']),portfolio=True)
-            controls['random_timing']=timing
-            controls['random_timing_note']=note or 'computed post hoc from stored trades (gen-trade reanalyze)'
-            events.append({'symbol':symbol,'fold':fold['index'],'seed':fold['base_seed'],
-                           'test_year':fold['test_first_open'][:4],'random_timing':timing,'note':note})
+            previous=frame['timestamp'].iloc[bounds['test_start']-1] if bounds['test_start'] else None
+            checked=False
+            for name in METHOD_NAMES:
+                controls=fold['exposure_controls'][name]
+                method=fold['methods'][name]
+                cadence=method.get('parameters',{}).get('decision_cadence','daily')
+                missing=name=='igtsp_ring' and controls.get('random_timing') is None and cadence=='daily'
+                realign=aligned and cadence!='daily'
+                if not (missing or realign):
+                    continue
+                execution=_execution_from(method['parameters']['execution'])
+                if not checked:
+                    plain=replace(execution,take_profit=None,stop_loss=None,max_holding_days=None)
+                    baseline=run_backtest(test,np.ones(len(test),dtype=np.int8),plain)
+                    stored=np.asarray(fold['baseline_backtest']['equity'],dtype=float)
+                    if baseline.equity.shape!=stored.shape or not np.allclose(baseline.equity,stored,rtol=1e-10,atol=1e-6):
+                        raise ValueError(f'{symbol} fold {fold["index"]}: reconstructed test window does not reproduce the stored baseline')
+                    checked=True
+                decision=decision_bars(test['timestamp'],cadence,previous) if cadence!='daily' else None
+                timing,note=random_timing(_result_from(method['backtest'],execution),test,execution,reps=reps,
+                                          seed=int(fold['effective_seed']),portfolio=name=='igtsp_ring',decision=decision)
+                if realign and controls.get('random_timing') is not None:
+                    controls['random_timing_unaligned']=controls['random_timing']
+                controls['random_timing']=timing
+                controls['random_timing_note']=note or ('recomputed post hoc with cadence-aligned placements'
+                                                        if realign else 'computed post hoc from stored trades')
+                events.append({'symbol':symbol,'method':name,'fold':fold['index'],'seed':fold['base_seed'],
+                               'test_year':fold['test_first_open'][:4],'cadence':cadence,'aligned':bool(realign),
+                               'random_timing':timing,'note':note})
     return events
 
 
-def reanalyze(source_directory,output_directory,*,data_directory=None,random_timing_reps=200,spa_reps=1000,pbo_blocks=8):
+posthoc_ring_timing=posthoc_timing  # earlier name
+
+
+def reanalyze(source_directory,output_directory,*,data_directory=None,random_timing_reps=200,spa_reps=1000,pbo_blocks=8,
+              aligned_timing=False):
     """EXTENSION (review 2026-11-05): recompute a finished benchmark's summary.
 
     Per-asset reports are read and never modified; the new summary, report and
@@ -676,11 +701,14 @@ def reanalyze(source_directory,output_directory,*,data_directory=None,random_tim
     old=json.loads((source/'summary.json').read_text())
     settings,manifest,symbols=old['settings'],old['dataset_manifest'],old['universe']
     reports={symbol:json.loads((source/(symbol.replace('/','_')+'.json')).read_text()) for symbol in symbols}
-    events=posthoc_ring_timing(reports,data_directory,settings,manifest,random_timing_reps) if data_directory else []
+    if aligned_timing and not data_directory:
+        raise ValueError('Cadence-aligned timing needs the data directory')
+    events=posthoc_timing(reports,data_directory,settings,manifest,random_timing_reps,aligned_timing) if data_directory else []
     records,pairs,paths=summarize(reports,manifest,settings)
     summary={**{key:old[key] for key in ('schema_version','data_kind','universe','settings','source_sha256') if key in old},
              'reanalysis':{'source_directory':str(source),'reanalysis_code_sha256':_code_hash(),
-                           'posthoc_ring_random_timing_folds':len(events),
+                           'posthoc_ring_random_timing_folds':sum(e['method']=='igtsp_ring' and not e['aligned'] for e in events),
+                           'posthoc_aligned_random_timing_runs':sum(e['aligned'] for e in events),
                            'note':'Statistics recomputed from unchanged per-asset reports; no strategy was refitted.'},
              'runs':records,'paired_comparisons':pairs,
              'method_runs':sum(len(report['folds'])*3 for report in reports.values()),
@@ -693,6 +721,6 @@ def reanalyze(source_directory,output_directory,*,data_directory=None,random_tim
     output.mkdir(parents=True,exist_ok=True)
     (output/'summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
     if events:
-        (output/'posthoc_ring_random_timing.json').write_text(json.dumps(events,indent=2,allow_nan=False)+'\n')
+        (output/'posthoc_random_timing.json').write_text(json.dumps(events,indent=2,allow_nan=False)+'\n')
     _render_report(output,summary,paths)
     return summary

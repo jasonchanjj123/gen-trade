@@ -16,20 +16,31 @@ import pandas as pd
 DECISION_CADENCES = ("daily", "weekly", "monthly")
 
 
-def decision_bars(timestamps, cadence: str) -> np.ndarray:
-    """True on the first bar of each period (and on the first bar overall)."""
+def _periods(times: pd.DatetimeIndex, cadence: str) -> np.ndarray:
+    if cadence == "weekly":
+        iso = times.isocalendar()
+        return np.asarray(iso["year"], dtype=np.int64) * 100 + np.asarray(iso["week"], dtype=np.int64)
+    return np.asarray(times.year * 12 + times.month, dtype=np.int64)
+
+
+def decision_bars(timestamps, cadence: str, previous=None) -> np.ndarray:
+    """True on the first bar of each period.
+
+    The first bar counts as a decision bar unless ``previous`` (the open time of
+    the bar just before this window) falls in the same period, which matches a
+    window cut from a longer history.
+    """
     if cadence not in DECISION_CADENCES:
         raise ValueError(f"decision_cadence must be one of {DECISION_CADENCES}")
     times = pd.DatetimeIndex(pd.to_datetime(timestamps, utc=True))
     if cadence == "daily":
         return np.ones(len(times), dtype=bool)
-    if cadence == "weekly":
-        iso = times.isocalendar()
-        period = np.asarray(iso["year"], dtype=np.int64) * 100 + np.asarray(iso["week"], dtype=np.int64)
-    else:
-        period = np.asarray(times.year * 12 + times.month, dtype=np.int64)
+    period = _periods(times, cadence)
     first = np.ones(len(period), dtype=bool)
     first[1:] = period[1:] != period[:-1]
+    if previous is not None and len(period):
+        before = _periods(pd.DatetimeIndex(pd.to_datetime([previous], utc=True)), cadence)[0]
+        first[0] = period[0] != before
     return first
 
 

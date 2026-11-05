@@ -20,14 +20,15 @@ from .experiments import (DEPLOY_POLICIES, METHOD_NAMES, VALIDATION_METRICS, Exp
                           run_trials)
 from .parallel import process_pool
 from .instruments import InstrumentSpec
+from .methods.cadence import decision_bars
 from .statistics import (alpha_beta, detailed_statistics, exposure_matched_blend, exposure_path, holm_adjust,
-                         paired_comparison, random_interval_signals)
+                         paired_comparison, random_aligned_signals, random_interval_signals)
 
 SELECTION_SCOPES = ("per_seed", "pooled")
 
 
 def exposure_controls(name, result, baseline, test, execution, *, periods_per_year, bootstrap_reps, seed,
-                      random_reps=200) -> dict:
+                      random_reps=200, decision=None) -> dict:
     """EXTENSION (audit item 3): separate timing skill from market exposure.
 
     Reports the capital-weighted time in market, a HAC alpha/beta regression on
@@ -48,7 +49,7 @@ def exposure_controls(name, result, baseline, test, execution, *, periods_per_ye
                 "exposure_matched_blend_net_return":float(blend.equity[-1]/blend.equity[0]-1),
                 "random_timing":None}
     timing, note = random_timing(result, test, execution, reps=random_reps, seed=seed,
-                                 portfolio=name == "igtsp_ring")
+                                 portfolio=name == "igtsp_ring", decision=decision)
     if timing is None:
         controls["random_timing_note"] = note
     else:
@@ -56,14 +57,22 @@ def exposure_controls(name, result, baseline, test, execution, *, periods_per_ye
     return controls
 
 
-def random_timing(result, test, execution, *, reps=200, seed=0, portfolio=False) -> tuple[dict | None, str | None]:
+def random_timing(result, test, execution, *, reps=200, seed=0, portfolio=False,
+                  decision=None) -> tuple[dict | None, str | None]:
     """Rank a held-out net return among random placements of the same trades.
 
     Single-position methods replay their holding durations at random times.
     EXTENSION (review 2026-11-05): portfolios do this independently in every
     active sleeve, each with its own allocation, and sum the sleeves plus the
     unused capital, so exposure, trade counts and durations match exactly.
+    With ``decision`` (a weekly/monthly cadence mask over the test bars),
+    random entries are restricted to the same decision points
+    (``statistics.random_aligned_signals``).
     """
+    def placements(trades, generator):
+        if decision is not None and not np.all(decision):
+            return random_aligned_signals(trades, len(test), reps, generator, decision)
+        return random_interval_signals(trades, len(test), reps, generator)
     rng = np.random.default_rng([seed, 7919])
     plain = replace(execution, max_holding_days=None, take_profit=None, stop_loss=None)
     initial = float(plain.initial_cash)
@@ -75,7 +84,7 @@ def random_timing(result, test, execution, *, reps=200, seed=0, portfolio=False)
             return None, "No trades (or no room to place them); random timing undefined."
         blocks, capital = [], []
         for name in sorted(sleeves, key=str):
-            signals = random_interval_signals(sleeves[name], len(test), reps, rng)
+            signals = placements(sleeves[name], rng)
             if signals is None:
                 return None, f"Sleeve {name} has no room to re-place its trades; random timing undefined."
             blocks.append(signals)
@@ -94,7 +103,7 @@ def random_timing(result, test, execution, *, reps=200, seed=0, portfolio=False)
         construction = ("each active sleeve replays its own holding durations and trade count at random times with its "
                         "allocation and the same costs; idle capital stays in cash")
     else:
-        signals = random_interval_signals(result.trades, len(test), reps, rng)
+        signals = placements(result.trades, rng)
         if signals is None:
             return None, "No trades (or no room to place them); random timing undefined."
         if plain.instrument is not None:
@@ -104,6 +113,8 @@ def random_timing(result, test, execution, *, reps=200, seed=0, portfolio=False)
         else:
             random_returns = np.array([run_backtest(test, signals[:, i], plain).total_return for i in range(reps)])
         construction = "same holding durations and trade count, random placement, same costs; exits replayed exactly"
+    if decision is not None and not np.all(decision):
+        construction += "; entries only after the strategy's decision bars"
     actual = float(result.total_return)
     return {"reps":reps, "method_net_return":actual,
             "random_median_net_return":float(np.median(random_returns)),
@@ -404,9 +415,15 @@ def compare_methods(
         fold_report["baselines"] = {"next_open_buy_and_hold":detailed_statistics(
             baseline,periods_per_year=periods_per_year,bootstrap_reps=bootstrap_reps,seed=fold_seed)}
         if exposure_controls_enabled:
+            start = fold_report["bounds"]["test_start"]
+            previous = bars["timestamp"].iloc[start - 1] if start else None
+            def cadence_mask(name):
+                cadence = fold_report["methods"][name].get("parameters", {}).get("decision_cadence", "daily")
+                return None if cadence == "daily" else decision_bars(test["timestamp"], cadence, previous)
             fold_report["exposure_controls"] = {name:exposure_controls(
                 name, results[name], baseline, test, executions[name], periods_per_year=periods_per_year,
-                bootstrap_reps=bootstrap_reps, seed=fold_seed, random_reps=random_timing_reps)
+                bootstrap_reps=bootstrap_reps, seed=fold_seed, random_reps=random_timing_reps,
+                decision=cadence_mask(name))
                 for name in METHOD_NAMES}
         if include_paths:fold_report['baseline_backtest']=export_backtest(baseline)
         if stress_instrument:

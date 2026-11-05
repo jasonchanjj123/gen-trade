@@ -51,6 +51,8 @@ def main(argv=None) -> int:
     reanalyze.add_argument('--data-directory',type=Path,help='Dataset used by the benchmark; enables post hoc Ring random timing')
     reanalyze.add_argument('--random-timing-reps',type=int,default=200)
     reanalyze.add_argument('--spa-reps',type=int,default=1000)
+    reanalyze.add_argument('--aligned-timing',action='store_true',
+                           help='Recompute random timing of weekly/monthly methods with entries at their decision points')
     for command in ("demo", "compare"):
         p = commands.add_parser(command)
         if command == "compare":
@@ -92,7 +94,8 @@ def main(argv=None) -> int:
         if args.command=='reanalyze':
             from .benchmark import reanalyze as run_reanalysis
             summary=run_reanalysis(args.source,args.output,data_directory=args.data_directory,
-                                   random_timing_reps=args.random_timing_reps,spa_reps=args.spa_reps)
+                                   random_timing_reps=args.random_timing_reps,spa_reps=args.spa_reps,
+                                   aligned_timing=args.aligned_timing)
             print(f"Reanalyzed {len(summary['universe'])} instruments into {args.output}")
             return 0
         if args.command=='benchmark':
