@@ -16,8 +16,8 @@ from .experiments import METHOD_NAMES,CANDIDATE_PROFILES
 from .instruments import benchmark_spec
 from .market_data import load_dataset, merge_fx_weekend_stubs
 from .runner import Fold,compare_methods
-from .statistics import (deflated_sharpe_ratio,detailed_statistics,holm_adjust,paired_comparison,pbo_cscv,
-                         probabilistic_sharpe_ratio,spa_test)
+from .statistics import (deflated_sharpe_ratio,detailed_statistics,excess_over_blend,holm_adjust,paired_comparison,
+                         pbo_cscv,probabilistic_sharpe_ratio,rademacher_antiserum,spa_excess,spa_test,stepm_excess)
 
 PROTOCOLS = {
     'original':{'compare':{}, 'fx_financing':.02, 'stock_minimum_spread':0., 'merge_fx_weekend_stubs':False},
@@ -25,7 +25,54 @@ PROTOCOLS = {
     'audited':{'compare':{'selection':'pooled','deploy':'validated','min_validation_trades':2,
                           'validation_curves':True,'exposure_controls_enabled':True},
                'fx_financing':0., 'stock_minimum_spread':.01, 'merge_fx_weekend_stubs':True},
+    # EXTENSION (review 2026-11-05): audited, plus configuration choice on the
+    # validation information ratio of excess over the exposure-matched blend.
+    'audited2':{'compare':{'selection':'pooled','deploy':'validated','min_validation_trades':2,
+                           'validation_curves':True,'exposure_controls_enabled':True,'validation_metric':'blend_excess'},
+                'fx_financing':0., 'stock_minimum_spread':.01, 'merge_fx_weekend_stubs':True},
 }
+LOCKBOX_FILE='lockbox.json'
+
+
+def profile_hash(candidates):
+    """Content hash of a method profile's candidate configurations."""
+    return hashlib.sha256(json.dumps(candidates,sort_keys=True).encode()).hexdigest()
+
+
+def freeze_profiles(path,*,first_test_year,symbols=(),profiles=None,note=''):
+    """EXTENSION: declare a lockbox and freeze the named profiles before using it.
+
+    Benchmarks refuse lockbox instruments or test years from ``first_test_year``
+    on unless explicitly unlocked, and an unlock only runs a profile whose
+    candidate configurations still hash to the frozen value.
+    """
+    names=list(profiles) if profiles else sorted(CANDIDATE_PROFILES)
+    if set(names)-set(CANDIDATE_PROFILES):
+        raise ValueError(f'Unknown profiles: {sorted(set(names)-set(CANDIDATE_PROFILES))}')
+    record={'created':pd.Timestamp.now(tz='UTC').isoformat(),'first_test_year':int(first_test_year),
+            'symbols':sorted(symbols),'frozen_profiles':{name:profile_hash(CANDIDATE_PROFILES[name]) for name in names},
+            'code_sha256_at_freeze':_code_hash(),'note':note or 'Untouched held-out data; unlock once, after freezing.'}
+    Path(path).write_text(json.dumps(record,indent=2)+'\n')
+    return record
+
+
+def check_lockbox(lockbox,*,symbols,last_test_year,method_profile,candidates,unlock):
+    """Refuse lockbox data unless unlocking a frozen, unchanged profile."""
+    if lockbox is None:
+        return None
+    touched=sorted(set(symbols)&set(lockbox.get('symbols',[])))
+    future=last_test_year>=int(lockbox['first_test_year'])
+    if not touched and not future:
+        return {'lockbox_touched':False}
+    if not unlock:
+        raise ValueError(f"Lockbox: symbols {touched} / test years >= {lockbox['first_test_year']} are held out; "
+                         'freeze the profile and pass unlock to run them once')
+    frozen=lockbox.get('frozen_profiles',{}).get(method_profile)
+    if frozen is None or frozen!=profile_hash(candidates):
+        raise ValueError(f'Lockbox: profile {method_profile!r} is not frozen or changed since freezing')
+    return {'lockbox_touched':True,'unlocked_symbols':touched,'unlocked_from_year':int(lockbox['first_test_year']),
+            'profile_hash':frozen,'lockbox_created':lockbox.get('created'),
+            'code_changed_since_freeze':lockbox.get('code_sha256_at_freeze')!=_code_hash()}
 
 
 def calendar_folds(bars,*,first_test_year=2019,last_test_year=2025,train_years=3,validation_years=1,embargo_bars=5):
@@ -171,7 +218,8 @@ def _returns(path):
 
 
 def _periods_per_year(report,manifest,symbol):
-    return report.get('periods_per_year_used',manifest['instruments'][symbol]['periods_per_year'])
+    used=report.get('periods_per_year_used')
+    return used if used is not None else manifest['instruments'][symbol]['periods_per_year']
 
 
 def selection_bias(reports,manifest,settings,paths,*,blocks=8,spa_reps=1000):
@@ -202,8 +250,75 @@ def selection_bias(reports,manifest,settings,paths,*,blocks=8,spa_reps=1000):
                                 reps=spa_reps,seed=int(seed)) for seed in settings['seeds']}
         spa['ensemble']=spa_test(benchmark,np.column_stack([_returns(paths[(symbol,name,'ensemble')]) for name in METHOD_NAMES]),
                                  reps=spa_reps,seed=0)
-        output.append({'symbol':symbol,'trials':len(keys),'trial_sharpe_variance_per_period':variance,
-                       'deflated_sharpe':dsr,'pbo_cscv':pbo,'spa_vs_buy_and_hold':spa})
+        row={'symbol':symbol,'trials':len(keys),'trial_sharpe_variance_per_period':variance,
+             'deflated_sharpe':dsr,'pbo_cscv':pbo,'spa_vs_buy_and_hold':spa}
+        if report['folds'] and all('exposure_controls' in f for f in report['folds']):
+            row.update(excess_tests(report,settings['seeds'],periods_per_year=_periods_per_year(report,manifest,symbol),
+                                    spa_reps=spa_reps))
+        output.append(row)
+    return output
+
+
+def _coefficient(controls,kind):
+    if kind=='blend':
+        return float(controls['mean_exposure'])
+    beta=controls['alpha_beta_vs_buy_and_hold'].get('beta')
+    return float(beta) if beta is not None else 0.
+
+
+def stitch_excess(asset_report,name,seeds,kind='blend'):
+    """EXTENSION (review 2026-11-05): held-out per-period excess returns.
+
+    ``kind='blend'`` subtracts the fold's exposure-matched cash/buy-and-hold
+    blend (coefficient = the fold's mean exposure); ``kind='beta'`` subtracts
+    the fold's beta times buy-and-hold, so the mean is the regression alpha.
+    ``seeds`` is one seed or a list; a list is the equal-capital ensemble, whose
+    coefficient is the seed mean (exposure is linear in capital at the start
+    of each year). Returns (excess, test year of each period).
+    """
+    seeds=list(seeds) if isinstance(seeds,(list,tuple)) else [seeds]
+    by_fold={}
+    for fold in asset_report['folds']:
+        if fold['base_seed'] not in seeds:
+            continue
+        if 'exposure_controls' not in fold:
+            raise ValueError('Excess returns need folds with exposure controls (audited protocol)')
+        path=fold['methods'][name]['backtest']
+        entry=by_fold.setdefault(fold['bounds']['test_start'],{'curves':[],'coefficients':[],
+            'baseline':fold['baseline_backtest'],'year':fold['test_first_open'][:4]})
+        entry['curves'].append(np.asarray(path['equity'],dtype=float)/path['initial_cash'])
+        entry['coefficients'].append(_coefficient(fold['exposure_controls'][name],kind))
+    excess,years=[],[]
+    for start in sorted(by_fold):
+        entry=by_fold[start]
+        if len(entry['curves'])!=len(seeds):
+            raise ValueError('Every seed needs every test fold for an excess path')
+        curve=np.mean(entry['curves'],axis=0)
+        values=excess_over_blend(np.diff(curve)/curve[:-1],_returns(entry['baseline']),float(np.mean(entry['coefficients'])))
+        excess.append(values);years.extend([entry['year']]*len(values))
+    return np.concatenate(excess),years
+
+
+def excess_tests(report,seeds,*,periods_per_year,spa_reps=1000):
+    """EXTENSION: SPA and StepM on excess over the blend / beta hedge, plus RAS.
+
+    These replace buy-and-hold as the null for timing skill: a method at 10%
+    exposure cannot beat buy-and-hold in a rising market whatever its timing.
+    RAS bounds every method-seed path's excess Sharpe at once.
+    """
+    def matrix(kind,seed):
+        return np.column_stack([stitch_excess(report,name,seeds if seed=='ensemble' else seed,kind)[0]
+                                for name in METHOD_NAMES])
+    labels=[*seeds,'ensemble']
+    output={'spa_excess_vs_blend':{str(s):spa_excess(matrix('blend',s),reps=spa_reps,seed=0 if s=='ensemble' else int(s))
+                                   for s in labels},
+            'spa_beta_hedged':{str(s):spa_excess(matrix('beta',s),reps=spa_reps,seed=0 if s=='ensemble' else int(s))
+                               for s in labels},
+            'stepm_excess_vs_blend':stepm_excess(matrix('blend','ensemble'),METHOD_NAMES,reps=spa_reps,seed=0)}
+    keys=[(name,seed) for name in METHOD_NAMES for seed in seeds]
+    paths=np.column_stack([stitch_excess(report,name,seed,'blend')[0] for name,seed in keys])
+    output['ras_excess_vs_blend']={'paths':[f'{name}:{seed}' for name,seed in keys],
+                                   **rademacher_antiserum(paths,reps=2000,seed=0,periods_per_year=periods_per_year)}
     return output
 
 
@@ -230,6 +345,55 @@ def exposure_summary(reports):
     return rows
 
 
+def _pooled(values,reference):
+    if len(values)<3:
+        return {'cells':len(values),'mean':None,'reference':reference}
+    x=np.array(list(values.values()))
+    years={}
+    for (_,year),value in values.items():
+        years.setdefault(year,[]).append(value)
+    yearly=np.array([np.mean(v) for _,v in sorted(years.items())])
+    def t(sample):
+        if len(sample)<2:return None
+        sd=float(np.std(sample,ddof=1))
+        return None if sd==0 else float((np.mean(sample)-reference)/(sd/np.sqrt(len(sample))))
+    return {'cells':int(len(x)),'mean':float(x.mean()),'reference':reference,'above_reference':int(np.sum(x>reference)),
+            't_cells_independent':t(x),'years':int(len(yearly)),'t_year_clustered':t(yearly)}
+
+
+def pooled_controls(reports,manifest):
+    """EXTENSION (review 2026-11-05): cross-instrument timing evidence per method.
+
+    Cells are instrument x test year with seeds averaged (seeds share the
+    year). Each metric reports the mean over cells, a t-statistic treating
+    cells as independent, and a year-clustered t over the yearly
+    cross-instrument means, which allows for common shocks within a year.
+    """
+    rows=[]
+    for name in METHOD_NAMES:
+        cells={}
+        for symbol,report in reports.items():
+            annual=_periods_per_year(report,manifest,symbol)
+            for fold in report['folds']:
+                controls=fold.get('exposure_controls',{}).get(name)
+                if controls is None:
+                    continue
+                cell=cells.setdefault((symbol,fold['test_first_open'][:4]),{'blend':[],'alpha':[],'timing':[]})
+                mean=controls['minus_exposure_matched_blend']['paired_return_difference_inference']['mean']
+                if mean is not None:cell['blend'].append(mean*annual)
+                alpha=controls['alpha_beta_vs_buy_and_hold'].get('alpha_annualized')
+                if alpha is not None:cell['alpha'].append(alpha)
+                if controls.get('random_timing'):cell['timing'].append(controls['random_timing']['percentile'])
+        if not cells:
+            continue
+        row={'method':name,'instrument_years':len(cells)}
+        for key,reference,label in (('blend',0.,'excess_vs_blend_annualized'),('alpha',0.,'alpha_annualized'),
+                                    ('timing',.5,'random_timing_percentile')):
+            row[label]=_pooled({k:float(np.mean(v[key])) for k,v in cells.items() if v[key]},reference)
+        rows.append(row)
+    return rows
+
+
 def _render_report(directory,summary,paths):
     directory=Path(directory)
     def percent(value):return 'undefined' if value is None else f'{value*100:.2f}%'
@@ -251,6 +415,8 @@ def _render_report(directory,summary,paths):
                 values=[v for v in values if v is not None]
                 return float(np.median(values)) if values else None
             lines.append(f"| {symbol} | {name} | {percent(median('net_total_return'))} | {percent(median('annualized_return'))} | {number(median('sharpe'))} | {percent(median('max_drawdown'))} | {percent(median('net_total_return',True))} | {sum(r['cash_fallback_folds'] for r in rows)} |")
+    if summary.get('reanalysis'):
+        lines[2:2]=[f"Reanalysis of `{summary['reanalysis']['source_directory']}` with the current statistics; per-asset reports unchanged, no strategy refitted. Ring random timing added post hoc for {summary['reanalysis']['posthoc_ring_random_timing_folds']} fold-seed runs.",'']
     settings=summary['settings']
     extended=settings.get('protocol','original')!='original' or settings.get('method_profile','paper')!='paper'
     if extended:
@@ -263,11 +429,20 @@ def _render_report(directory,summary,paths):
             lines.append(f"| {row['symbol']} | {row['method']} | {percent(st['net_total_return'])} | {percent(st['annualized_return'])} | {number(st['sharpe'])} | {percent(st['max_drawdown'])} | {percent(row['cost_stress_statistics']['net_total_return'])} |")
         if summary.get('exposure_controls'):
             lines+=['','## Exposure controls (medians over fold-seed test years)','',
-                    'Beating the blend = share of test years whose mean daily return exceeds a static cash/buy-and-hold mix with the same mean exposure. Random-timing percentile = rank of the net return among random entry times with the same holding durations and costs (single-position methods).',
+                    'Beating the blend = share of test years whose mean daily return exceeds a static cash/buy-and-hold mix with the same mean exposure. Random-timing percentile = rank of the net return among random entry times with the same holding durations and costs (per sleeve for Ring when computed).',
                     '','| Instrument | Method | Exposure | Beta | Alpha (annual) | Beating blend | Random-timing pct | Test years without trades |',
                     '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |']
             for row in summary['exposure_controls']:
                 lines.append(f"| {row['symbol']} | {row['method']} | {number(row['median_exposure'])} | {number(row['median_beta'])} | {percent(row['median_alpha_annualized'])} | {percent(row['share_beating_exposure_matched_blend'])} | {number(row['median_random_timing_percentile'])} | {row['test_years_without_trades']} / {row['fold_seed_runs']} |")
+    if summary.get('pooled_controls'):
+        def tval(value):return '–' if value is None else f'{value:+.2f}'
+        lines+=['','## Pooled timing evidence (all instruments)','',
+                'Cells are instrument × test year with seeds averaged. t (cells) treats cells as independent; t (years) uses the yearly cross-instrument means, allowing common shocks within a year. Random timing is per sleeve for Ring.',
+                '','| Method | Cells | Excess vs blend (annual) | t (cells) | t (years) | Alpha (annual) | t (years) | Random-timing pct | t (years) |',
+                '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+        for row in summary['pooled_controls']:
+            blend,alpha,timing=row['excess_vs_blend_annualized'],row['alpha_annualized'],row['random_timing_percentile']
+            lines.append(f"| {row['method']} | {row['instrument_years']} | {percent(blend['mean'])} | {tval(blend.get('t_cells_independent'))} | {tval(blend.get('t_year_clustered'))} | {percent(alpha['mean'])} | {tval(alpha.get('t_year_clustered'))} | {number(timing['mean'])} | {tval(timing.get('t_year_clustered'))} |")
     if summary.get('selection_bias'):
         lines+=['','## Selection-bias statistics','',
                 'DSR deflates each method-seed path by the expected best of all method-seed trials for that instrument. PBO (CSCV, 8 blocks) is the probability that the path ranked best on half the years falls below the median on the other half. SPA tests H0: no method beats buy-and-hold (consistent p-value).',
@@ -277,6 +452,19 @@ def _render_report(directory,summary,paths):
             seeds=[v['pvalue_consistent'] for k,v in row['spa_vs_buy_and_hold'].items() if k!='ensemble' and v.get('pvalue_consistent') is not None]
             spa_range=f"{min(seeds):.2f}–{max(seeds):.2f}" if seeds else 'undefined'
             lines.append(f"| {row['symbol']} | {number(best[1]['deflated_sharpe_ratio'])} ({best[0]}) | {number(row['pbo_cscv'].get('pbo'))} | {number(row['spa_vs_buy_and_hold']['ensemble'].get('pvalue_consistent'))} | {spa_range} |")
+        if any('spa_excess_vs_blend' in row for row in summary['selection_bias']):
+            lines+=['','## Tests against the exposure-matched blend','',
+                    'SPA with a zero benchmark on excess returns: H0 = no method has positive mean excess over its exposure-matched blend (or, beta-hedged, positive alpha). StepM lists methods whose excess is positive at 5% familywise error (ensembles). RAS: method-seed paths whose excess Sharpe stays positive after the Rademacher data-snooping haircut.',
+                    '','| Instrument | SPA p, excess vs blend (ensembles) | SPA p range (seeds) | SPA p, beta-hedged (ensembles) | StepM superior | RAS positive paths |',
+                    '| --- | ---: | --- | ---: | --- | --- |']
+            for row in summary['selection_bias']:
+                if 'spa_excess_vs_blend' not in row:continue
+                spa,hedged=row['spa_excess_vs_blend'],row['spa_beta_hedged']
+                seeds=[v['pvalue_consistent'] for k,v in spa.items() if k!='ensemble' and v.get('pvalue_consistent') is not None]
+                spa_range=f"{min(seeds):.2f}–{max(seeds):.2f}" if seeds else 'undefined'
+                ras=row['ras_excess_vs_blend']
+                positive=[p for p,ok in zip(ras['paths'],ras['rademacher_positive']) if ok]
+                lines.append(f"| {row['symbol']} | {number(spa['ensemble'].get('pvalue_consistent'))} | {spa_range} | {number(hedged['ensemble'].get('pvalue_consistent'))} | {', '.join(row['stepm_excess_vs_blend']['superior_models']) or 'none'} | {', '.join(positive) or 'none'} |")
     fx_line=('- FX observed spread plus 0.1 bp slippage and 0.35 bp commission per side; financing debit 2% annualized on held notional over actual calendar time. This is a declared scenario, not historical broker swap data.'
              if settings.get('protocol','original')=='original' else
              '- FX observed spread plus 0.1 bp slippage and 0.35 bp commission per side; primary scenario has zero carry, stress applies the original 2%/yr debit. Historical carry signs are not modeled. Sunday stub candles are merged into the next session.')
@@ -320,15 +508,28 @@ def _render_report(directory,summary,paths):
 def run_benchmark(data_directory,output_directory,*,population_size=64,generations=20,seeds=(11,22,33),workers=3,
                   first_test_year=2019,last_test_year=2025,embargo_bars=5,bootstrap_reps=500,resume=True,
                   symbols=None,method_profile='paper',protocol='original',random_timing_reps=200,pbo_blocks=8,
-                  spa_reps=1000):
-    if method_profile not in CANDIDATE_PROFILES or protocol not in PROTOCOLS:
-        raise ValueError(f'method_profile must be one of {sorted(CANDIDATE_PROFILES)}; protocol one of {sorted(PROTOCOLS)}')
+                  spa_reps=1000,method_configs=None,lockbox=None,unlock_lockbox=False):
+    if method_configs is not None:
+        method_profile='custom'
+        if set(method_configs)!=set(METHOD_NAMES):
+            raise ValueError(f'method_configs must give candidates for every method: {METHOD_NAMES}')
+        candidates={name:tuple(dict(c) for c in method_configs[name]) for name in METHOD_NAMES}
+    elif method_profile not in CANDIDATE_PROFILES:
+        raise ValueError(f'method_profile must be one of {sorted(CANDIDATE_PROFILES)}')
+    else:
+        candidates=CANDIDATE_PROFILES[method_profile]
+    if protocol not in PROTOCOLS:
+        raise ValueError(f'protocol must be one of {sorted(PROTOCOLS)}')
     rules=PROTOCOLS[protocol]
     markets,manifest=load_dataset(data_directory)
     symbols=list(symbols) if symbols is not None else list(markets)
     if not symbols or len(set(symbols))!=len(symbols) or set(symbols)-set(markets):
         raise ValueError('Benchmark symbols must be a unique nonempty subset of the downloaded universe')
-    candidates=CANDIDATE_PROFILES[method_profile]
+    if lockbox is None and (Path(__file__).resolve().parents[2]/LOCKBOX_FILE).exists():
+        lockbox=Path(__file__).resolve().parents[2]/LOCKBOX_FILE
+    lock=check_lockbox(json.loads(Path(lockbox).read_text()) if lockbox else None,symbols=symbols,
+                       last_test_year=last_test_year,method_profile=method_profile,candidates=candidates,
+                       unlock=unlock_lockbox)
     settings={'population_size':population_size,'generations':generations,'seeds':list(seeds),'workers':workers,
               'first_test_year':first_test_year,'last_test_year':last_test_year,'embargo_bars':embargo_bars,
               'bootstrap_reps':bootstrap_reps,'train_years':3,'validation_years':1,'initial_cash':100000,
@@ -338,6 +539,8 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
         # reports keep resuming under the original settings dictionary.
         settings.update(method_profile=method_profile,protocol=protocol,protocol_rules=rules,
                         random_timing_reps=random_timing_reps)
+    if lock and lock.get('lockbox_touched'):
+        settings['lockbox']=lock
     directory=Path(output_directory);directory.mkdir(parents=True,exist_ok=True)
     source_hash=_code_hash();reports={};start=perf_counter()
     for symbol in symbols:
@@ -391,8 +594,105 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
              'cost_scenarios':'primary and doubled assumed costs; same frozen models',
              'selection_bias':selection_bias(reports,manifest,settings,paths,blocks=pbo_blocks,spa_reps=spa_reps),
              'exposure_controls':exposure_summary(reports),
+             'pooled_controls':pooled_controls(reports,manifest),
              'dataset_manifest':manifest}
     (directory/'summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
     _render_report(directory,summary,paths)
     print(f'Completed benchmark: {summary["method_runs"]} method runs; report {directory/"report.md"}',flush=True)
+    return summary
+
+
+def _execution_from(record):
+    from dataclasses import fields
+    from .instruments import InstrumentSpec
+    values={f.name:record[f.name] for f in fields(ExecutionConfig) if f.name in record}
+    if values.get('instrument') is not None:
+        values['instrument']=InstrumentSpec(**values['instrument'])
+    if values.get('entry_hours') is not None:
+        values['entry_hours']=tuple(values['entry_hours'])
+    return ExecutionConfig(**values)
+
+
+def _result_from(path,execution):
+    from .backtest import Trade
+    trades=tuple(Trade(**{**row,'entry_time':pd.Timestamp(row['entry_time']),'exit_time':pd.Timestamp(row['exit_time'])})
+                 for row in path['trades'])
+    return BacktestResult(np.asarray(path['equity'],dtype=float),np.asarray([t.return_fraction for t in trades]),trades,
+                          execution,tuple(pd.to_datetime(path['timestamps'],utc=True)))
+
+
+def posthoc_ring_timing(reports,data_directory,settings,manifest,reps=200):
+    """EXTENSION: fill Ring random-timing controls missing from finished reports.
+
+    Rebuilds each fold's test window from the same dataset (hash checked) and
+    protocol, and refuses unless next-open buy-and-hold on that window
+    reproduces the stored baseline equity. Only stored trades are used; no
+    strategy is refitted or re-predicted.
+    """
+    from dataclasses import replace
+    from .backtest import run_backtest
+    from .runner import random_timing
+    markets,data_manifest=load_dataset(data_directory)
+    rules=settings.get('protocol_rules') or PROTOCOLS[settings.get('protocol','original')]
+    events=[]
+    for symbol,report in reports.items():
+        if data_manifest['instruments'][symbol]['sha256']!=manifest['instruments'][symbol]['sha256']:
+            raise ValueError(f'{symbol}: dataset differs from the one the benchmark used')
+        frame=markets[symbol]
+        if rules.get('merge_fx_weekend_stubs') and '/' in symbol:
+            frame,_=merge_fx_weekend_stubs(frame)
+        for fold in report['folds']:
+            controls=fold.get('exposure_controls',{}).get('igtsp_ring')
+            if controls is None or controls.get('random_timing') is not None:
+                continue
+            bounds=fold['bounds']
+            test=frame.iloc[bounds['test_start']:bounds['test_stop']].reset_index(drop=True)
+            method=fold['methods']['igtsp_ring']
+            execution=_execution_from(method['parameters']['execution'])
+            plain=replace(execution,take_profit=None,stop_loss=None,max_holding_days=None)
+            baseline=run_backtest(test,np.ones(len(test),dtype=np.int8),plain)
+            stored=np.asarray(fold['baseline_backtest']['equity'],dtype=float)
+            if baseline.equity.shape!=stored.shape or not np.allclose(baseline.equity,stored,rtol=1e-10,atol=1e-6):
+                raise ValueError(f'{symbol} fold {fold["index"]}: reconstructed test window does not reproduce the stored baseline')
+            timing,note=random_timing(_result_from(method['backtest'],execution),test,execution,reps=reps,
+                                      seed=int(fold['effective_seed']),portfolio=True)
+            controls['random_timing']=timing
+            controls['random_timing_note']=note or 'computed post hoc from stored trades (gen-trade reanalyze)'
+            events.append({'symbol':symbol,'fold':fold['index'],'seed':fold['base_seed'],
+                           'test_year':fold['test_first_open'][:4],'random_timing':timing,'note':note})
+    return events
+
+
+def reanalyze(source_directory,output_directory,*,data_directory=None,random_timing_reps=200,spa_reps=1000,pbo_blocks=8):
+    """EXTENSION (review 2026-11-05): recompute a finished benchmark's summary.
+
+    Per-asset reports are read and never modified; the new summary, report and
+    chart go to a separate directory. With ``data_directory`` Ring's missing
+    random-timing controls are added post hoc (see ``posthoc_ring_timing``).
+    """
+    source,output=Path(source_directory),Path(output_directory)
+    if source.resolve()==output.resolve():
+        raise ValueError('Write the reanalysis to a new directory; source reports stay unchanged')
+    old=json.loads((source/'summary.json').read_text())
+    settings,manifest,symbols=old['settings'],old['dataset_manifest'],old['universe']
+    reports={symbol:json.loads((source/(symbol.replace('/','_')+'.json')).read_text()) for symbol in symbols}
+    events=posthoc_ring_timing(reports,data_directory,settings,manifest,random_timing_reps) if data_directory else []
+    records,pairs,paths=summarize(reports,manifest,settings)
+    summary={**{key:old[key] for key in ('schema_version','data_kind','universe','settings','source_sha256') if key in old},
+             'reanalysis':{'source_directory':str(source),'reanalysis_code_sha256':_code_hash(),
+                           'posthoc_ring_random_timing_folds':len(events),
+                           'note':'Statistics recomputed from unchanged per-asset reports; no strategy was refitted.'},
+             'runs':records,'paired_comparisons':pairs,
+             'method_runs':sum(len(report['folds'])*3 for report in reports.values()),
+             'cash_fallback_method_folds':sum(row['cash_fallback_folds'] for row in records if row['seed']!='ensemble'),
+             'cost_scenarios':old.get('cost_scenarios'),
+             'selection_bias':selection_bias(reports,manifest,settings,paths,blocks=pbo_blocks,spa_reps=spa_reps),
+             'exposure_controls':exposure_summary(reports),
+             'pooled_controls':pooled_controls(reports,manifest),
+             'dataset_manifest':manifest}
+    output.mkdir(parents=True,exist_ok=True)
+    (output/'summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
+    if events:
+        (output/'posthoc_ring_random_timing.json').write_text(json.dumps(events,indent=2,allow_nan=False)+'\n')
+    _render_report(output,summary,paths)
     return summary

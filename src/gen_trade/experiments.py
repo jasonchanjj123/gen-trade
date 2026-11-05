@@ -31,7 +31,20 @@ IMPROVED_CANDIDATES = {
     "mstgam": ({**_MSTGAM_EXT, "min_votes":3}, {**_MSTGAM_EXT, "min_votes":2}),
     "igtsp_ring": ({**_RING_EXT, "groups":12}, {**_RING_EXT, "groups":17}),
 }
-CANDIDATE_PROFILES = {"paper":DEFAULT_CANDIDATES, "improved":IMPROVED_CANDIDATES}
+# Review 2026-11-05 profile: every method's search scores excess over an
+# exposure-matched blend on resampled training months (methods/robust_fitness.py);
+# Ring uses equal group weights. Validation knobs are unchanged.
+_MOO3_ROBUST = {"objectives":"blend_excess", "complexity_penalty":.01, "min_trades_per_year":3.,
+                "feature_transform":"scale_free"}
+_MSTGAM_ROBUST = {"fitness":"blend_excess", "mutation":"lognormal", "min_trades_per_year":3.}
+_RING_ROBUST = {**_RING_EXT, "fitness":"blend_excess", "weight_mode":"equal"}
+ROBUST_CANDIDATES = {
+    "moo3": ({**_MOO3_ROBUST, "threshold_volatility_multiple":1.}, {**_MOO3_ROBUST, "threshold_volatility_multiple":2.}),
+    "mstgam": ({**_MSTGAM_ROBUST, "min_votes":3}, {**_MSTGAM_ROBUST, "min_votes":2}),
+    "igtsp_ring": ({**_RING_ROBUST, "groups":12}, {**_RING_ROBUST, "groups":17}),
+}
+CANDIDATE_PROFILES = {"paper":DEFAULT_CANDIDATES, "improved":IMPROVED_CANDIDATES, "robust":ROBUST_CANDIDATES}
+VALIDATION_METRICS = ("log_wealth_minus_drawdown", "blend_excess")
 DEPLOY_POLICIES = ("refit", "validated")
 
 
@@ -98,6 +111,7 @@ class ExperimentJob:
     deploy: str = "refit"
     min_validation_trades: int = 1
     validation_curve: bool = False
+    validation_metric: str = "log_wealth_minus_drawdown"
 
 
 def _features(job: ExperimentJob, stop: int) -> dict | None:
@@ -124,6 +138,26 @@ def validation_score(result: BacktestResult, min_trades: int = 1) -> float | Non
     return float(np.log(result.equity[-1] / result.equity[0]) - drawdown)
 
 
+def blend_excess_score(result: BacktestResult, bars: pd.DataFrame, execution: ExecutionConfig,
+                       min_trades: int = 1) -> float | None:
+    """EXTENSION (review 2026-11-05): validation information ratio of the
+    excess over a cash/buy-and-hold blend with the strategy's mean exposure."""
+    from .methods.robust_fitness import benchmark_returns, excess_information_ratio, period_returns, periods_per_year
+    from .statistics import exposure_path
+    if len(result.trades) < max(1, min_trades):
+        return None
+    score = excess_information_ratio(period_returns(result.equity), exposure_path(result),
+                                     benchmark_returns(bars, execution), periods_per_year=periods_per_year(bars))[0]
+    return float(score)
+
+
+def _score(job: ExperimentJob, result: BacktestResult) -> float | None:
+    if job.validation_metric == "blend_excess":
+        bars = job.history.iloc[job.validation_start:job.validation_stop].reset_index(drop=True)
+        return blend_excess_score(result, bars, job.execution, job.min_validation_trades)
+    return validation_score(result, job.min_validation_trades)
+
+
 def _model(job: ExperimentJob, config: dict):
     options = dict(population_size=job.population_size, generations=job.generations,
                    seed=job.seed, execution=job.execution, **config)
@@ -140,7 +174,7 @@ def _validation_curve(model, job: ExperimentJob) -> list[dict] | None:
     curve = []
     for generation, snapshot in model.generation_snapshots():
         result = evaluate_window(snapshot, job, job.validation_start, job.validation_stop)
-        curve.append({"generation":generation, "validation_score":validation_score(result, job.min_validation_trades),
+        curve.append({"generation":generation, "validation_score":_score(job, result),
                       "validation_net_return":result.total_return, "validation_trade_count":len(result.trades)})
     return curve
 
@@ -171,7 +205,7 @@ def run_trials(job: ExperimentJob, models: list | None = None) -> list[dict]:
         trial["parameters"] = model.parameters()
         if job.validation_start is not None:
             result = evaluate_window(model, job, job.validation_start, job.validation_stop)
-            score = validation_score(result, job.min_validation_trades)
+            score = _score(job, result)
             trial.update(validation_score=score, validation_net_return=result.total_return,
                          validation_trade_count=len(result.trades),
                          status="eligible" if score is not None else "no_validation_trades")
@@ -235,7 +269,9 @@ def finish_experiment(job: ExperimentJob, trials: list[dict], winner: int | None
         selected_model = _model(job, config).fit(job.history.iloc[:stop].reset_index(drop=True),
                                                  extra_features=_features(job, stop))
     result = evaluate_window(selected_model, job, job.test_start, len(job.history))
-    score_text = (f"log(net wealth multiple) minus max drawdown; >={max(1, job.min_validation_trades)} validation trade"
+    score_text = (("information ratio of excess over the exposure-matched blend" if job.validation_metric == "blend_excess"
+                   else "log(net wealth multiple) minus max drawdown")
+                  + f"; >={max(1, job.min_validation_trades)} validation trade"
                   + ("s" if job.min_validation_trades > 1 else ""))
     method_report = {
         "parameters":selected_model.parameters(), "training":selected_model.diagnostics,

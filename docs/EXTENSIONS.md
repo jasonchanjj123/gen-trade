@@ -95,3 +95,83 @@ evolution, pooled majority selection, training-only validated deployment,
 exposure/alpha/blend identities, random-timing duration replay, PSR/DSR/PBO/SPA
 behavior, the tick floor, the cost scenarios and the causal Sunday merge.
 Paper-default suites are unchanged.
+
+## Review 2026-11-05 extensions
+
+These follow `claude/review-2026-11-05.md` in the gen-trader project. The
+paper and improved profiles are unchanged: small fits of every method under
+both profiles reproduce the previous code exactly. Everything below is opt-in.
+
+### Tests on the quantity that measures timing
+
+| Change | Where | Why |
+| --- | --- | --- |
+| SPA on excess over the exposure-matched blend and on beta-hedged returns (zero benchmark), per seed and for the ensembles | `statistics.spa_excess`, `benchmark.excess_tests` | SPA against buy-and-hold rejects a 10%-exposure strategy in any rising market regardless of timing |
+| Romano–Wolf StepM on blend excess: which methods are positive at 5% familywise error | `statistics.stepm_excess` | SPA only says whether any method beats the null |
+| Rademacher Anti-Serum over every method-seed path's blend excess | `statistics.rademacher_antiserum` | Uniform lower bound on true Sharpe for all tested paths ([Paleologo 2024](https://bsic.it/wp-content/uploads/2024/10/backtesting-episod-2.pdf); constants from secondary summaries) |
+| Random timing for Ring: each active sleeve replays its own durations at random times with its allocation; idle capital stays in cash | `runner.random_timing` | Ring had no chance-timing control; for one full sleeve it reduces exactly to the single-position test |
+| Pooled timing evidence: instrument × year cells, seeds averaged, with a naive t and a year-clustered t | `benchmark.pooled_controls` | Per-instrument tests have little power (IR 0.3: 12% on 7 years) |
+| `gen-trade reanalyze SRC --output DST [--data-directory D]` recomputes a finished benchmark's summary with the current statistics; with data it adds Ring random timing post hoc after checking that the rebuilt test windows reproduce the stored buy-and-hold equity | `benchmark.reanalyze` | Corrected tests on existing reports without refitting |
+
+### Fitness that targets the tested quantity
+
+`methods/robust_fitness.py`: each candidate is scored by the annualized
+information ratio of its daily net return in excess of a static cash/buy-and-
+hold blend with its own mean exposure, `d_t = r_t − e·b_t`. Static exposure
+earns exactly zero, so the score rewards only being invested on better days.
+Each generation scores a fresh random half of the training months (stochastic
+sub-window fitness; [Gonçalves and Silva 2012](https://gpbib.cs.ucl.ac.uk/gp-html/goncalves_2012_EuroGP.html),
+[Geiger et al. 2025](https://arxiv.org/abs/2502.18093v1)); elites are re-scored
+on every sample and the final pick uses the full window. Each fit also reports
+a Rademacher haircut over every evaluated candidate's training excess
+(`selection_haircut`), so the search's own data snooping is visible per fold.
+
+| Method | Option | Change |
+| --- | --- | --- |
+| MOO3 | `objectives="blend_excess"`, `complexity_penalty` | Scalar score = sub-window excess IR minus a per-node penalty; all three objective slots carry it, so Pareto rank is score order, survival is NSGA-II truncation and the pick is the best full-window score |
+| MOO3 | `objectives="single"` | Scalar baseline: lower bound of annualized log growth, (Σ log(1+q) − z·√n·s)/years, under the same trade floor (s is the trade-return std) |
+| MSTGAM | `fitness="blend_excess"`, `min_trades_per_year` | Weight search on sub-window excess IR; DC threshold calibration keeps the t-statistic; deployed weights are the final population's best on the full window |
+| Ring | `fitness="blend_excess"` | Excess IR of the capital mixture's marked-to-market daily return |
+| All | `subwindow_fraction` (default 0.5) | Share of training months per generation |
+
+### Ring mixture and weights
+
+| Option | Change | Why |
+| --- | --- | --- |
+| `fitness="mixture_mtm"` | Mixture return/drawdown on marked-to-market daily sleeve equity | Eq.9 averages trades closing in a month (three sequential +2% trades book +2%, not +6.1%) and never marks open positions |
+| `weight_mode="equal"` | Evolve memberships and TP/SL with equal group weights | 1/N baseline |
+| `weight_mode="lp"` | Evolve with equal weights, then solve group weights exactly: max (M_T − 1)/maxDD(M) over the simplex by Dinkelbach iteration on an LP (running-peak drawdown formulation) | With memberships fixed the weight problem is convex-fractional; the GA's weights were near random |
+
+### Protocol, profile and lockbox
+
+- `--protocol audited2`: the audited protocol, with configurations chosen on
+  the validation excess IR instead of log wealth minus drawdown.
+- `--method-profile robust`: blend-excess fitness for all three methods (MOO3
+  complexity penalty 0.01 per node, trade floors of 3 per year), Ring equal
+  weights. Validation knobs are unchanged.
+- `--method-configs FILE`: any candidate set as profile `custom`, for example
+  to compare Ring weight modes.
+- `gen-trade freeze-profiles --first-test-year 2026 [--symbols ...]` writes
+  `lockbox.json`. The benchmark then refuses lockbox symbols and test years
+  unless `--unlock-lockbox` is given with a profile whose candidates still hash
+  to the frozen value; the unlock is recorded in the report settings.
+
+```bash
+# Corrected tests on the existing reports (no refitting)
+gen-trade reanalyze reports/audited-improved-v2 --output reports/audited-improved-v2-reanalysis \
+  --data-directory data/stocks-fx-2015-2025
+# New profile and protocol
+gen-trade benchmark --protocol audited2 --method-profile robust --output reports/audited2-robust
+# Isolate the protocol change
+gen-trade benchmark --protocol audited2 --method-profile improved --output reports/audited2-improved
+```
+
+`tests/test_review_extensions.py` checks each defining property: equity and
+exposure recording identical to full records, SPA/StepM/RAS behavior, the
+single-sleeve reduction and idle-cash rule of portfolio random timing,
+deterministic month sub-windows, zero excess for static exposure, MSTGAM
+determinism and trade floor, MOO3 scalar objectives and the complexity
+penalty, daily profiles equal to compounded trades, LP weights at the global
+ratio maximum, Ring variants deploying their weights, the validation metric
+and protocol header, lockbox refusal and unlock, stitched excess identities
+and year-clustered pooling.

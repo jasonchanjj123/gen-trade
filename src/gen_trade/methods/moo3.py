@@ -19,6 +19,15 @@ split invariant) and mean trade return with its lower confidence bound;
 truncation; ``feature_transform="scale_free"`` removes price levels and shares
 scaling within feature families; ``threshold_volatility_multiple`` fits the DC
 threshold to training volatility.
+
+Review 2026-11-05: ``objectives="single"`` is a scalar baseline, the lower
+confidence bound of annualized log growth, (sum log(1+q) - z*sqrt(n)*s)/years,
+with s the sample trade-return std (close to the log-return std for small
+trades); ``objectives="blend_excess"`` scores the information ratio of daily
+excess over an exposure-matched blend on a fresh random half of the training
+months each generation, minus ``complexity_penalty`` per tree node. Scalar
+objectives fill all three slots, so Pareto rank equals score order, survival
+is plain NSGA-II truncation and the final pick is the best score.
 """
 from __future__ import annotations
 
@@ -33,7 +42,8 @@ import pandas as pd
 from ..backtest import ExecutionConfig, run_backtest
 from .indicators import FEATURE_TRANSFORMS, FeatureScaler, feature_families, raw_features
 
-OBJECTIVE_SETS = ("paper", "robust")
+OBJECTIVE_SETS = ("paper", "robust", "single", "blend_excess")
+SCALAR_OBJECTIVES = ("single", "blend_excess")
 SURVIVAL_RULES = ("nsga2", "nsga2_sequential", "nsga3")
 
 
@@ -89,6 +99,10 @@ def evaluate_tree(node: Node, features: dict[str, np.ndarray], n: int) -> np.nda
     if node.op == "lt":
         return valid & (left < right)
     raise ValueError(f"Unknown tree operator {node.op!r}")
+
+
+def node_count(node: Node) -> int:
+    return 1 + sum(node_count(child) for child in node.children)
 
 
 def _paths(node: Node, path=()):
@@ -277,7 +291,8 @@ class MOO3:
         execution: ExecutionConfig | None = None, *,
         objectives: str = "paper", min_trades_per_year: float | None = None,
         lcb_z: float = 1.0, survival: str = "nsga2", feature_transform: str = "paper",
-        threshold_volatility_multiple: float | None = None,
+        threshold_volatility_multiple: float | None = None, complexity_penalty: float = 0.0,
+        subwindow_fraction: float = 0.5,
     ):
         if objectives not in OBJECTIVE_SETS:
             raise ValueError(f"objectives must be one of {OBJECTIVE_SETS}")
@@ -295,6 +310,11 @@ class MOO3:
         self.objectives, self.survival, self.feature_transform = objectives, survival, feature_transform
         self.min_trades_per_year = None if min_trades_per_year is None else float(min_trades_per_year)
         self.lcb_z = float(lcb_z)
+        if not np.isfinite(complexity_penalty) or complexity_penalty < 0:
+            raise ValueError("complexity_penalty must be finite and nonnegative")
+        if not np.isfinite(subwindow_fraction) or not 0 < subwindow_fraction <= 1:
+            raise ValueError("subwindow_fraction must be in (0,1]")
+        self.complexity_penalty, self.subwindow_fraction = float(complexity_penalty), float(subwindow_fraction)
         self.threshold_volatility_multiple = (None if threshold_volatility_multiple is None
                                               else float(threshold_volatility_multiple))
         if type(population_size) is not int or population_size < 4:
@@ -352,6 +372,10 @@ class MOO3:
                     log_growth: float) -> tuple[float, float, float]:
         if self.objectives == "paper":
             return (total_paper, mean, std)
+        if self.objectives == "single":
+            sample_std = std * math.sqrt(count / (count - 1)) if count > 1 else 0.0
+            score = (log_growth - self.lcb_z * math.sqrt(count) * sample_std) / self._training_years
+            return (score, score, -score)
         # Scale-free compounded trade return (%), lower confidence bound of the
         # mean trade return using the sample standard error, and trade std.
         sample_std = std * math.sqrt(count / (count - 1)) if count > 1 else 0.0
@@ -374,6 +398,9 @@ class MOO3:
         years = max((known.iloc[-1] - times.iloc[0]).total_seconds() / (365.25 * 86400), 0.0)
         minimum = 2 if self.min_trades_per_year is None else max(2, math.ceil(self.min_trades_per_year * years))
         constrained = self.min_trades_per_year is not None
+        self._training_years = max(years, 1e-9)
+        scalar = self.objectives in SCALAR_OBJECTIVES
+        survival_rule = "nsga2" if scalar else self.survival
 
         def record(tree, count, objectives):
             finite = bool(np.isfinite(objectives).all())
@@ -416,11 +443,56 @@ class MOO3:
                 record(tree, count, objectives)
             return self._individual(tree, cache)
 
-        references = das_dennis(3, reference_divisions(self.population_size)) if self.survival == "nsga3" else None
+        excess_state = {}
+        if self.objectives == "blend_excess":
+            from .robust_fitness import SubWindows, bar_months, benchmark_returns, periods_per_year, period_returns
+            excess_state = {"paths": {}, "mask": None, "ppy": periods_per_year(bars),
+                            "benchmark": benchmark_returns(bars, self.execution),
+                            "sampler": SubWindows(bar_months(bars), self.seed, self.subwindow_fraction)}
+
+            def excess_many(trees):
+                """Cache full-window paths once; re-score every requested tree on the current mask."""
+                from .robust_fitness import excess_information_ratio
+                nonlocal prepared_market
+                paths = excess_state["paths"]
+                missing = list(dict.fromkeys(tree for tree in trees if tree not in paths))
+                if missing:
+                    decisions = np.column_stack([evaluate_tree(tree, features, len(bars)).astype(np.int8) for tree in missing])
+                    if self.execution.instrument is not None:
+                        from ..market_execution import MarketArrays, execute_batch
+                        if prepared_market is None:
+                            prepared_market = MarketArrays.from_bars(bars, self.execution.instrument)
+                        outcome = execute_batch(prepared_market, decisions, self.execution, record_equity=True,
+                                                record_exposure=True)
+                        returns, held, counts = period_returns(outcome.equity), outcome.held, outcome.trade_counts
+                    else:
+                        from ..statistics import exposure_path
+                        results = [run_backtest(bars, decisions[:, i], self.execution) for i in range(len(missing))]
+                        returns = np.column_stack([period_returns(r.equity) for r in results])
+                        held = np.column_stack([exposure_path(r) for r in results])
+                        counts = [len(r.trades) for r in results]
+                    for i, tree in enumerate(missing):
+                        paths[tree] = (returns[:, i].astype(np.float32), held[:, i].astype(np.float32), int(counts[i]))
+                unique = list(dict.fromkeys(trees))
+                scores = excess_information_ratio(np.column_stack([paths[tree][0] for tree in unique]),
+                                                  np.column_stack([paths[tree][1] for tree in unique]),
+                                                  excess_state["benchmark"], excess_state["mask"],
+                                                  periods_per_year=excess_state["ppy"])
+                for tree, score in zip(unique, scores):
+                    value = float(score) - self.complexity_penalty * node_count(tree)
+                    record(tree, paths[tree][2], (value, value, -value))
+                return [self._individual(tree, cache) for tree in trees]
+
+            evaluate_many = excess_many
+        references = das_dennis(3, reference_divisions(self.population_size)) if survival_rule == "nsga3" else None
         coverage = Node("gt", (Node("constant", value=1.0), Node("constant", value=0.0)))
         population = evaluate_many([coverage]+[self._tree(rng,names,self.max_depth) for _ in range(self.population_size-1)])
         history = []
         for generation in range(self.generations + 1):
+            if excess_state:
+                # A fresh training-month sample; parents are re-scored on it too.
+                excess_state["mask"] = excess_state["sampler"].mask(generation)
+                population = evaluate_many([p.tree for p in population])
             fronts = rank_fronts(population, constrained=constrained)
             history.append({"generation": generation, "eligible": sum(p.eligible for p in population),
                             "pareto_size": sum(population[i].eligible for i in fronts[0])})
@@ -437,14 +509,14 @@ class MOO3:
             survival = []
             for front in rank_fronts(combined, constrained=constrained):
                 room = self.population_size - len(survival)
-                if self.survival == "nsga2":
+                if survival_rule == "nsga2":
                     # Paper path, unchanged: every admitted front in crowding order
                     # (population order feeds the index-based tournaments).
                     ordered = sorted(front, key=lambda i: combined[i].crowding, reverse=True)
                     survival.extend(ordered[:room])
                 elif len(front) <= room:
                     survival.extend(sorted(front, key=lambda i: combined[i].crowding, reverse=True))
-                elif self.survival == "nsga2_sequential":
+                elif survival_rule == "nsga2_sequential":
                     kept = sequential_truncation(_minimization([combined[i] for i in front]), room)
                     survival.extend(front[k] for k in kept)
                 else:
@@ -454,6 +526,9 @@ class MOO3:
                 if len(survival) == self.population_size:
                     break
             population = [combined[i] for i in survival]
+        if excess_state:
+            excess_state["mask"] = None  # final choice on the full training window
+            population = evaluate_many([p.tree for p in population])
         final_front = [population[i] for i in rank_fronts(population, constrained=constrained)[0] if population[i].eligible]
         # Remove duplicate genotypes from the reported front without changing evolution.
         final_front = list({p.tree: p for p in final_front}.values())
@@ -461,22 +536,43 @@ class MOO3:
             raise ValueError("MOO3 found no eligible strategy with at least "
                              + ("two" if minimum == 2 else str(minimum)) + " completed trades")
         objectives = np.asarray([p.objectives for p in final_front])
-        scores, normalization = modified_sharpe(objectives, self.preferences)
+        if scalar:
+            scores, normalization = objectives[:, 0], None
+        else:
+            scores, normalization = modified_sharpe(objectives, self.preferences)
         winner = int(np.argmax(scores))
         self._selected = final_front[winner].tree
-        names_of_objectives = (("paper_total_return_pct", "mean_trade_return", "trade_return_std")
-                               if self.objectives == "paper" else
-                               ("compounded_trade_return_pct", "mean_trade_return_lower_bound", "trade_return_std"))
+        names_of_objectives = {"paper":("paper_total_return_pct", "mean_trade_return", "trade_return_std"),
+                               "robust":("compounded_trade_return_pct", "mean_trade_return_lower_bound", "trade_return_std"),
+                               "single":("lcb_annual_log_growth", "lcb_annual_log_growth_copy", "negative_score"),
+                               "blend_excess":("penalized_excess_information_ratio", "score_copy", "negative_score"),
+                               }[self.objectives]
+        haircut = None
+        if excess_state:
+            from .robust_fitness import excess_paths, selection_haircut
+            pool = [tree for tree, value in excess_state["paths"].items() if value[2] >= minimum]
+            if self._selected in pool:
+                paths = excess_paths(np.column_stack([excess_state["paths"][tree][0] for tree in pool]),
+                                     np.column_stack([excess_state["paths"][tree][1] for tree in pool]),
+                                     excess_state["benchmark"])
+                haircut = selection_haircut(paths, pool.index(self._selected), periods_per_year=excess_state["ppy"],
+                                            seed=self.seed)
+                haircut["scope"] = "every distinct evaluated tree meeting the trade floor"
         self._diagnostics = {
             "method": "moo3", "source_doi": "10.1007/s10462-025-11390-9",
             "unique_evaluations": len(cache), "minimum_completed_trades": minimum,
             "variant": {"objectives": self.objectives, "survival": self.survival,
                         "feature_transform": self.feature_transform,
-                        "constrained_domination": constrained, "fitted_threshold": self.fitted_threshold_},
+                        "constrained_domination": constrained, "fitted_threshold": self.fitted_threshold_,
+                        **({"scalar_objective": True, "effective_survival": survival_rule,
+                            "complexity_penalty_per_node": self.complexity_penalty} if scalar else {}),
+                        **({"subwindows": excess_state["sampler"].describe(), "selection_haircut": haircut}
+                           if excess_state else {})},
             "objective_names": list(names_of_objectives),
             "history": history, "selected_index": winner, "training_front_normalization": normalization,
             "pareto_front": [{"rule": p.tree.to_dict(), **dict(zip(names_of_objectives, p.objectives)),
-                              "completed_trades": p.trade_count, "modified_sharpe": float(scores[i])}
+                              "completed_trades": p.trade_count,
+                              ("selection_score" if scalar else "modified_sharpe"): float(scores[i])}
                              for i, p in enumerate(final_front)],
             "feature_count": len(names), "training_feature_bounds": {k: list(v) for k, v in self._scaler.bounds.items()},
         }
@@ -500,6 +596,7 @@ class MOO3:
                 "preferences": list(self.preferences), "execution": asdict(self.execution),
                 "objectives": self.objectives, "min_trades_per_year": self.min_trades_per_year,
                 "lcb_z": self.lcb_z, "survival": self.survival, "feature_transform": self.feature_transform,
+                "complexity_penalty": self.complexity_penalty, "subwindow_fraction": self.subwindow_fraction,
                 "threshold_volatility_multiple": self.threshold_volatility_multiple,
                 "fitted_threshold": getattr(self, "fitted_threshold_", None),
                 "entry_rule": self._selected.to_dict() if self._selected is not None else None}

@@ -7,7 +7,7 @@ data and retain all trials before interpreting an interval or p-value.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 import numpy as np
 import statsmodels.api as sm
@@ -464,3 +464,100 @@ def spa_test(benchmark_returns: np.ndarray, model_returns: np.ndarray, *, block_
     return {"pvalue_lower": _finite(values["lower"]), "pvalue_consistent": _finite(values["consistent"]),
             "pvalue_upper": _finite(values["upper"]), "models": int(models.shape[1]), "reps": reps,
             "null": "no model has lower expected loss (higher expected return) than the benchmark"}
+
+
+# --- EXTENSION (review 2026-11-05): tests on the quantity that measures timing ---
+
+def excess_over_blend(returns: np.ndarray, benchmark_returns: np.ndarray, exposure: float) -> np.ndarray:
+    """Per-period excess over a static cash/benchmark mix, ``r_t - e * b_t``.
+
+    With ``e`` the strategy's mean exposure this removes the return a static
+    position of the same average size would have earned; with ``e = beta`` it
+    is the beta-hedged return whose mean is the regression alpha.
+    """
+    r, b = np.asarray(returns, dtype=float), np.asarray(benchmark_returns, dtype=float)
+    if r.shape != b.shape or not np.isfinite(exposure):
+        raise ValueError("Excess returns need aligned periods and a finite exposure")
+    return r - float(exposure) * b
+
+
+def spa_excess(excess: np.ndarray, *, block_size: float = 12, reps: int = 1000, seed: int = 0) -> dict[str, Any]:
+    """Hansen SPA on excess returns: H0 = no column has a positive mean excess.
+
+    The benchmark loss is zero, so each model is judged against its own
+    exposure-matched blend (or beta hedge) instead of against buy-and-hold,
+    which a low-exposure strategy cannot beat in a rising market regardless
+    of timing.
+    """
+    values = np.asarray(excess, dtype=float)
+    if values.ndim == 1:
+        values = values[:, None]
+    result = spa_test(np.zeros(values.shape[0]), values, block_size=block_size, reps=reps, seed=seed)
+    result["null"] = "no model has a positive expected excess return"
+    return result
+
+
+def stepm_excess(excess: np.ndarray, names: Sequence[str], *, size: float = 0.05, block_size: float = 12,
+                 reps: int = 1000, seed: int = 0) -> dict[str, Any]:
+    """Romano-Wolf StepM on excess returns: which models have positive mean excess.
+
+    Controls the familywise error rate at ``size`` across the listed models.
+    """
+    import pandas as pd
+    from arch.bootstrap import StepM
+    values = np.asarray(excess, dtype=float)
+    if values.ndim != 2 or values.shape[1] != len(names) or values.shape[0] < 8:
+        raise ValueError("StepM needs an aligned periods-by-models excess matrix")
+    if all(_constant(values[:, i]) for i in range(values.shape[1])):
+        return {"superior_models": [], "size": size, "note": "All series constant."}
+    test = StepM(np.zeros(values.shape[0]), pd.DataFrame(-values, columns=list(names)), size=size,
+                 block_size=int(max(1, round(block_size))), reps=reps, seed=seed)
+    test.compute()
+    return {"superior_models": [str(x) for x in test.superior_models], "size": size, "reps": reps,
+            "null": "each model has a nonpositive expected excess return (familywise error controlled)"}
+
+
+def rademacher_antiserum(returns: np.ndarray, *, delta: float = 0.05, reps: int = 2000, seed: int = 0,
+                         periods_per_year: float | None = None) -> dict[str, Any]:
+    """Rademacher Anti-Serum lower bound on every tested strategy's Sharpe.
+
+    Paleologo (2024), as summarized in secondary sources: with returns
+    standardized by each column's sample volatility, the empirical Rademacher
+    complexity is R = E_eps[max_n (1/T) sum_t eps_t x_tn], and with
+    probability >= 1 - delta, simultaneously for all N columns,
+
+        SR_n >= SR_hat_n - 2R - 3 sqrt(2 ln(2/delta)/T) - sqrt(2 ln(2N/delta)/T).
+
+    Per-period Sharpe ratios. ``2R`` is the data-snooping haircut; a column
+    with SR_hat - 2R > 0 is "Rademacher positive". The estimation terms are
+    conservative at daily frequency, so the full bound is rarely positive.
+    """
+    values = np.asarray(returns, dtype=float)
+    if values.ndim == 1:
+        values = values[:, None]
+    if values.ndim != 2 or values.shape[0] < 8 or not np.isfinite(values).all():
+        raise ValueError("RAS needs a finite periods-by-strategies return matrix")
+    if not 0 < delta < 1 or type(reps) is not int or reps < 1:
+        raise ValueError("RAS needs delta in (0,1) and a positive integer rep count")
+    periods, count = values.shape
+    scale = values.std(axis=0, ddof=1)
+    standardized = np.divide(values, scale, out=np.zeros_like(values), where=scale > 0)
+    sharpe = standardized.mean(axis=0)
+    rng = np.random.default_rng(seed)
+    total = 0.0
+    for start in range(0, reps, 256):
+        signs = rng.choice((-1.0, 1.0), size=(min(256, reps - start), periods))
+        total += float(np.sum(np.max(signs @ standardized / periods, axis=1)))
+    complexity = total / reps
+    estimation = 3 * np.sqrt(2 * np.log(2 / delta) / periods) + np.sqrt(2 * np.log(2 * count / delta) / periods)
+    snooping_adjusted = sharpe - 2 * complexity
+    bound = snooping_adjusted - estimation
+    annual = np.sqrt(periods_per_year) if periods_per_year else None
+    return {"delta": delta, "periods": periods, "strategies": count, "reps": reps,
+            "rademacher_complexity": complexity, "data_snooping_haircut": 2 * complexity,
+            "estimation_haircut": float(estimation),
+            "sharpe_per_period": sharpe.tolist(), "snooping_adjusted_sharpe_per_period": snooping_adjusted.tolist(),
+            "lower_bound_per_period": bound.tolist(),
+            "rademacher_positive": (snooping_adjusted > 0).tolist(), "bound_positive": (bound > 0).tolist(),
+            "annualized_snooping_adjusted_sharpe": (snooping_adjusted * annual).tolist() if annual else None,
+            "source": "Paleologo (2024), The Elements of Quantitative Investing; constants via secondary summaries"}

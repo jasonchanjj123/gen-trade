@@ -31,11 +31,26 @@ def main(argv=None) -> int:
     benchmark.add_argument('--embargo-bars',type=int,default=5)
     benchmark.add_argument('--symbols',nargs='+',help='Optional subset of the downloaded universe')
     benchmark.add_argument('--no-resume',action='store_true')
-    benchmark.add_argument('--method-profile',choices=('paper','improved'),default='paper',
-                           help='paper-faithful candidates, or the labeled extension variants (docs/EXTENSIONS.md)')
-    benchmark.add_argument('--protocol',choices=('original','audited'),default='original',
-                           help='original protocol, or pooled seed selection, validated deployment, exposure controls and audited costs')
+    benchmark.add_argument('--method-profile',choices=('paper','improved','robust'),default='paper',
+                           help='paper-faithful candidates, or labeled extension variants (docs/EXTENSIONS.md)')
+    benchmark.add_argument('--method-configs',type=Path,help='JSON mapping every method to its candidate list (profile "custom")')
+    benchmark.add_argument('--protocol',choices=('original','audited','audited2'),default='original',
+                           help='original; audited (pooled seed selection, validated deployment, exposure controls, audited costs); audited2 (audited + blend-excess validation score)')
+    benchmark.add_argument('--lockbox',type=Path,help='Lockbox declaration (default: lockbox.json in the repository root, if present)')
+    benchmark.add_argument('--unlock-lockbox',action='store_true',help='Run held-out lockbox data once with a frozen profile')
+    freeze=commands.add_parser('freeze-profiles',help='Declare a lockbox and freeze method profiles before touching it')
+    freeze.add_argument('--output',type=Path,default=Path('lockbox.json'))
+    freeze.add_argument('--first-test-year',type=int,required=True)
+    freeze.add_argument('--symbols',nargs='*',default=[],help='Instruments reserved for the lockbox')
+    freeze.add_argument('--profiles',nargs='*',help='Profiles to freeze (default: all)')
+    freeze.add_argument('--note',default='')
     benchmark.add_argument('--random-timing-reps',type=int,default=200)
+    reanalyze=commands.add_parser('reanalyze',help='Recompute a finished benchmark summary with the current statistics')
+    reanalyze.add_argument('source',type=Path,help='Finished benchmark directory (left unchanged)')
+    reanalyze.add_argument('--output',type=Path,required=True,help='New directory for summary.json/report.md')
+    reanalyze.add_argument('--data-directory',type=Path,help='Dataset used by the benchmark; enables post hoc Ring random timing')
+    reanalyze.add_argument('--random-timing-reps',type=int,default=200)
+    reanalyze.add_argument('--spa-reps',type=int,default=1000)
     for command in ("demo", "compare"):
         p = commands.add_parser(command)
         if command == "compare":
@@ -74,13 +89,27 @@ def main(argv=None) -> int:
             manifest=fetch_dataset(args.directory,start=args.start,end=args.end,refresh=args.refresh)
             print(f"Verified {len(manifest['universe'])} instruments in {args.directory}")
             return 0
+        if args.command=='reanalyze':
+            from .benchmark import reanalyze as run_reanalysis
+            summary=run_reanalysis(args.source,args.output,data_directory=args.data_directory,
+                                   random_timing_reps=args.random_timing_reps,spa_reps=args.spa_reps)
+            print(f"Reanalyzed {len(summary['universe'])} instruments into {args.output}")
+            return 0
         if args.command=='benchmark':
             from .benchmark import run_benchmark
             run_benchmark(args.data_directory,args.output,population_size=args.population,generations=args.generations,
                           seeds=tuple(args.seeds),workers=args.workers,first_test_year=args.first_test_year,
                           last_test_year=args.last_test_year,embargo_bars=args.embargo_bars,bootstrap_reps=args.bootstrap_reps,
                           resume=not args.no_resume,symbols=args.symbols,method_profile=args.method_profile,
-                          protocol=args.protocol,random_timing_reps=args.random_timing_reps)
+                          protocol=args.protocol,random_timing_reps=args.random_timing_reps,
+                          method_configs=json.loads(args.method_configs.read_text()) if args.method_configs else None,
+                          lockbox=args.lockbox,unlock_lockbox=args.unlock_lockbox)
+            return 0
+        if args.command=='freeze-profiles':
+            from .benchmark import freeze_profiles
+            record=freeze_profiles(args.output,first_test_year=args.first_test_year,symbols=args.symbols,
+                                   profiles=args.profiles,note=args.note)
+            print(f"Froze {len(record['frozen_profiles'])} profile(s); lockbox from {record['first_test_year']} in {args.output}")
             return 0
         markets = synthetic_markets(args.bars,args.seed) if args.command == "demo" else read_market_data(args.data)
         genes = tuple(FeatureGene(source,lag=1,max_age="4D") for source in ("XAU/USD","EUR/USD")) if args.cross_market_features else ()

@@ -1,0 +1,12 @@
+{
+  "created": "2026-11-05T07:58:14.627938+00:00",
+  "first_test_year": 2026,
+  "symbols": [],
+  "frozen_profiles": {
+    "improved": "97858e906fc95e5b498cb799ebfe0feac9fce8d8421c92485c56cc5110d7e043",
+    "paper": "98d6dec0c19047580fb1975765a91791f52a41017d373a79daf515d618ce3cdc",
+    "robust": "b2420fa55432b475291a780401b72245f685e1c11bc96de43228a0cc8ea4c138"
+  },
+  "code_sha256_at_freeze": "3597b7f61a071ee4aca0eff145ddd61c32d500e94ff8df3352ae54e366fd28fb",
+  "note": "Forward data from 2026 is held out. Add never-examined instruments with --symbols before fetching them."
+}

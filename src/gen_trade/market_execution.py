@@ -103,6 +103,8 @@ class MarketBatch:
     dividends: np.ndarray
     months: tuple
     trade_log_growth: np.ndarray | None = None
+    # EXTENSION: per-bar invested flags (bars x strategies), recorded on request.
+    held: np.ndarray | None = None
 
     @property
     def compounded_trade_return(self) -> np.ndarray:
@@ -110,7 +112,12 @@ class MarketBatch:
         return np.expm1(self.trade_log_growth) if self.trade_log_growth is not None else None
 
 
-def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,stop_loss=None,record=False):
+def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,stop_loss=None,record=False,
+                  record_equity=False,record_exposure=False):
+    """Vectorized costed execution. ``record`` keeps equity and Trade objects;
+    ``record_equity`` keeps only the marked-to-market equity path and
+    ``record_exposure`` the per-bar invested flags (extensions; results are
+    otherwise identical)."""
     from .backtest import Trade
     spec = config.instrument
     signals=np.asarray(signals)
@@ -134,8 +141,10 @@ def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,sto
     counts=np.zeros(m,dtype=int); return_sum=np.zeros(m); means=np.zeros(m); m2=np.zeros(m); log_growth=np.zeros(m)
     unit_profit=np.zeros(m); first_unit_capital=np.zeros(m)
     monthly_sum=np.zeros((len(market.months),m)); monthly_counts=np.zeros_like(monthly_sum,dtype=int)
-    equity_path=np.empty((len(market.times)+1,m)) if record else None
-    if record: equity_path[0]=cash
+    keep_equity=record or record_equity
+    equity_path=np.empty((len(market.times)+1,m)) if keep_equity else None
+    if keep_equity: equity_path[0]=cash
+    held_path=np.zeros((len(market.times),m),dtype=bool) if record_exposure else None
     ledger=[]
     slip=config.slippage_bps/10000
     fee_rate=config.fee+spec.commission_bps/10000
@@ -262,16 +271,17 @@ def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,sto
         last_equity=equity(market.bid_close[i],market.ask_close[i],market.conversion_bid_close[i],market.conversion_ask_close[i])
         margin_applicable=(spec.asset_class=='fx') | (spec.leverage>1) | (quantity<0)
         pending[(quantity!=0)&margin_applicable&(last_equity<=entry_notional/spec.leverage*spec.maintenance_margin_fraction)]=3
-        if record:equity_path[i+1]=last_equity
+        if keep_equity:equity_path[i+1]=last_equity
+        if record_exposure:held_path[i]=quantity!=0
     close(quantity!=0,market.bid_close[-1],market.ask_close[-1],market.conversion_bid_close[-1],market.conversion_ask_close[-1],
           len(market.times)-1,int(market.close_month[-1]),market.known[-1],'sample_end')
     last_equity=cash.copy()
-    if record:equity_path[-1]=cash
+    if keep_equity:equity_path[-1]=cash
     monthly=np.divide(monthly_sum,monthly_counts,out=np.zeros_like(monthly_sum),where=monthly_counts>0)
     std=np.sqrt(np.maximum(np.divide(m2,counts,out=np.zeros_like(m2),where=counts>0),0))
     paper=np.divide(100*unit_profit,first_unit_capital,out=np.zeros(m),where=first_unit_capital>0)
     return MarketBatch(equity_path,last_equity,counts,return_sum,std,paper,monthly.T,monthly_counts.T,ledger,
-                       total_fees,total_carry,total_dividends,market.months,log_growth)
+                       total_fees,total_carry,total_dividends,market.months,log_growth,held_path)
 
 
 def run_market_backtest(bars,signals,config):

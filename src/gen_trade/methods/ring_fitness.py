@@ -50,14 +50,20 @@ class MonthlyProfiles:
     mean_returns: np.ndarray
     monthly_trade_counts: np.ndarray
     months: tuple[str, ...]
+    # EXTENSION (review 2026-11-05): marked-to-market daily wealth per sleeve
+    # (strategies x bars+1, starting at 1) and per-bar invested flags.
+    daily_wealth: np.ndarray | None = None
+    held: np.ndarray | None = None
 
 
 def monthly_trade_profiles(market: PreparedMarket, signals: np.ndarray, config: ExecutionConfig,
-                           *, initial_cash=None, take_profit=None, stop_loss=None) -> MonthlyProfiles:
+                           *, initial_cash=None, take_profit=None, stop_loss=None, daily: bool = False) -> MonthlyProfiles:
     """Vectorize strategies while matching run_backtest fills, costs and exits.
 
     Attribute each closed trade to its UTC exit month, average trade fractions
     within months, set empty months to zero, and compound monthly means (Eq.9).
+    ``daily=True`` (extension) also returns marked-to-market daily wealth and
+    per-bar invested flags for every strategy.
     """
     signals = np.asarray(signals)
     if config.instrument is not None:
@@ -65,9 +71,15 @@ def monthly_trade_profiles(market: PreparedMarket, signals: np.ndarray, config: 
             raise ValueError("Instrument execution requires an instrument-prepared market")
         from ..market_execution import execute_batch
         outcome = execute_batch(market.advanced,signals,config,initial_cash=initial_cash,
-                                take_profit=take_profit,stop_loss=stop_loss)
+                                take_profit=take_profit,stop_loss=stop_loss,record_equity=daily,record_exposure=daily)
         wealth = np.column_stack((np.ones(signals.shape[1]),np.cumprod(1+outcome.monthly_returns,axis=1)))
-        return MonthlyProfiles(wealth,outcome.trade_counts,outcome.monthly_returns,outcome.monthly_counts,market.months)
+        daily_wealth = held_flags = None
+        if daily:
+            start = outcome.equity[0]
+            daily_wealth = np.divide(outcome.equity, start, out=np.ones_like(outcome.equity), where=start > 0).T
+            held_flags = outcome.held.T.astype(float)
+        return MonthlyProfiles(wealth,outcome.trade_counts,outcome.monthly_returns,outcome.monthly_counts,market.months,
+                               daily_wealth,held_flags)
     if (signals.ndim != 2 or signals.shape[0] != len(market.opens) or not signals.shape[1]
             or not np.isin(signals, [-1, 0, 1]).all()):
         raise ValueError("Trade profiles need an aligned n-by-strategy signal matrix")
@@ -79,6 +91,9 @@ def monthly_trade_profiles(market: PreparedMarket, signals: np.ndarray, config: 
     entry_time = np.zeros(n, dtype=np.int64)
     slip = config.slippage_bps / 10_000
     holding_ns = pd.Timedelta(days=config.max_holding_days).value if config.max_holding_days is not None else None
+    capital = np.ones(n)
+    daily_wealth = np.ones((n, len(market.opens) + 1)) if daily else None
+    held_flags = np.zeros((n, len(market.opens))) if daily else None
     for i in range(len(market.opens)):
         signal = signals[i-1] if i and market.known_ns[i-1] <= market.time_ns[i] else np.zeros(n, dtype=np.int8)
         exits = held & (pending | (signal == -1))
@@ -87,6 +102,7 @@ def monthly_trade_profiles(market: PreparedMarket, signals: np.ndarray, config: 
         if exits.any():
             sums[market.open_month[i], exits] += market.opens[i] * (1-slip) * (1-config.fee) / entry_cost[exits] - 1
             counts[market.open_month[i], exits] += 1
+            capital[exits] *= market.opens[i] * (1-slip) * (1-config.fee) / entry_cost[exits]
             held[exits], pending[exits] = False, False
         allowed = config.entry_hours is None or market.entry_hours[i] in config.entry_hours
         if allowed:
@@ -100,15 +116,19 @@ def monthly_trade_profiles(market: PreparedMarket, signals: np.ndarray, config: 
             pending |= held & (market.closes[i] >= entry_fill * (1+config.take_profit))
         if config.stop_loss is not None:
             pending |= held & (market.closes[i] <= entry_fill * (1-config.stop_loss))
+        if daily:
+            held_flags[:, i] = held
+            daily_wealth[:, i+1] = np.where(held, capital * market.closes[i] * (1-slip) * (1-config.fee) / entry_cost,
+                                            capital)
     if held.any():
         sums[market.final_month, held] += market.closes[-1] * (1-slip) * (1-config.fee) / entry_cost[held] - 1
         counts[market.final_month, held] += 1
     means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
     wealth = np.column_stack((np.ones(n), np.cumprod(1+means, axis=0).T))
-    return MonthlyProfiles(wealth, counts.sum(axis=0), means.T, counts.T, market.months)
+    return MonthlyProfiles(wealth, counts.sum(axis=0), means.T, counts.T, market.months, daily_wealth, held_flags)
 
 
-FITNESS_VARIANTS = ("paper", "mixture_drawdown")
+FITNESS_VARIANTS = ("paper", "mixture_drawdown", "mixture_mtm", "blend_excess")
 
 
 def portfolio_fitness(chromosome, monthly_wealth: np.ndarray, trade_counts: np.ndarray,
@@ -128,8 +148,8 @@ def portfolio_fitness(chromosome, monthly_wealth: np.ndarray, trade_counts: np.n
     rewards low correlation, and replaces membership entropy with entropy of the
     group capital weights. ``sign_adjusted`` applies Israelsen's refinement.
     """
-    if variant not in FITNESS_VARIANTS:
-        raise ValueError(f"Ring fitness variant must be one of {FITNESS_VARIANTS}")
+    if variant not in FITNESS_VARIANTS[:3]:
+        raise ValueError(f"portfolio_fitness variant must be one of {FITNESS_VARIANTS[:3]}; blend_excess uses portfolio_excess_fitness")
     paths, counts = np.asarray(monthly_wealth, dtype=float), np.asarray(trade_counts)
     if (paths.ndim != 2 or paths.shape[0] != len(chromosome.assignments) or paths.shape[1] < 2
             or counts.shape != (len(chromosome.assignments),)
@@ -168,5 +188,91 @@ def portfolio_fitness(chromosome, monthly_wealth: np.ndarray, trade_counts: np.n
             "risk_denominator_floored":portfolio_risk < risk_floor,
             "ratio_capped":abs(raw) > ratio_cap,
             "completed_sleeve_trades":count,
-            "fitness_equations":"6-16" if variant == "paper" else "extension_mixture_drawdown_capital_entropy",
+            "fitness_equations":{"paper":"6-16","mixture_drawdown":"extension_mixture_drawdown_capital_entropy",
+                                 "mixture_mtm":"extension_marked_to_market_daily_mixture_drawdown_capital_entropy"}[variant],
             "fitness_variant":variant, "sign_adjusted":sign_adjusted}
+
+
+def portfolio_excess_fitness(chromosome, daily_wealth: np.ndarray, held: np.ndarray, trade_counts: np.ndarray,
+                             benchmark: np.ndarray, mask: np.ndarray | None, *, periods_per_year: float,
+                             weights: np.ndarray | None = None) -> dict:
+    """EXTENSION (review 2026-11-05): information ratio of the capital mixture's
+    daily return in excess of a cash/buy-and-hold blend with the mixture's own
+    mean exposure, on the masked training periods (see robust_fitness)."""
+    from .robust_fitness import excess_information_ratio
+    allocations = chromosome.allocations() if weights is None else np.asarray(weights, dtype=float)
+    mixture = allocations @ np.asarray(daily_wealth, dtype=float)
+    returns = np.diff(mixture) / mixture[:-1]
+    exposure = allocations @ np.asarray(held, dtype=float)
+    count = int(np.sum(np.asarray(trade_counts)[allocations > 0]))
+    score = float(excess_information_ratio(returns, exposure, benchmark, mask, periods_per_year=periods_per_year)[0])
+    eligible = count >= 2 and bool(np.isfinite(score))
+    return {"fitness":score if eligible else INVALID_FITNESS, "eligible":eligible,
+            "excess_information_ratio":score, "mean_exposure":float(exposure.mean()),
+            "mixture_return":float(mixture[-1] - 1), "completed_sleeve_trades":count,
+            "fitness_equations":"extension_excess_over_exposure_matched_blend_information_ratio",
+            "fitness_variant":"blend_excess"}
+
+
+def drawdown_ratio_weights(group_paths: np.ndarray, *, risk_floor: float = 1e-6, max_iterations: int = 50,
+                           tolerance: float = 1e-10) -> tuple[np.ndarray | None, dict]:
+    """EXTENSION: simplex weights maximizing (M_T - 1) / max drawdown of M = w @ P.
+
+    Absolute drawdown of a linear mixture is a maximum of linear functions, so
+    max R(w) - lam * DD(w) is a linear program (running-peak formulation of
+    Chekhlov, Uryasev and Zabarankin). Dinkelbach's iteration on lam reaches
+    the global maximum of the ratio because R is linear and DD convex.
+    ``group_paths`` is groups x (bars + 1). Returns (weights, diagnostics);
+    weights are None when no mixture has a positive return.
+    """
+    from scipy.optimize import linprog
+    from scipy.sparse import coo_matrix, vstack
+    paths = np.asarray(group_paths, dtype=float)
+    if paths.ndim != 2 or paths.shape[0] < 1 or paths.shape[1] < 2 or not np.isfinite(paths).all():
+        raise ValueError("LP weights need a finite groups-by-periods wealth matrix")
+    k, n = paths.shape
+    gains = paths[:, -1] - 1
+    if gains.max() <= 0:
+        return None, {"status":"no_positive_return", "iterations":0}
+
+    def drawdown(w):
+        mixture = w @ paths
+        return max(float(np.max(np.maximum.accumulate(mixture) - mixture)), risk_floor)
+
+    def ratio(w):
+        return float(gains @ w) / drawdown(w)
+
+    rows_p, cols_p, values_p = np.repeat(np.arange(n), k), np.tile(np.arange(k), n), paths.T.ravel()
+    eye, width = np.arange(n), k + n + 1
+    # Variables: w (k), u (n, running peak), z (max drawdown).
+    peak = coo_matrix((np.concatenate([values_p, -np.ones(n)]),
+                       (np.concatenate([rows_p, eye]), np.concatenate([cols_p, k + eye]))), shape=(n, width))
+    monotone = coo_matrix((np.concatenate([np.ones(n - 1), -np.ones(n - 1)]),
+                           (np.concatenate([eye[:-1], eye[:-1]]), np.concatenate([k + eye[:-1], k + eye[1:]]))),
+                          shape=(n - 1, width))
+    depth = coo_matrix((np.concatenate([-values_p, np.ones(n), -np.ones(n)]),
+                        (np.concatenate([rows_p, eye, eye]), np.concatenate([cols_p, k + eye, np.full(n, k + n)]))),
+                       shape=(n, width))
+    a_ub = vstack([peak, monotone, depth]).tocsr()
+    b_ub = np.zeros(a_ub.shape[0])
+    a_eq = np.zeros((1, width)); a_eq[0, :k] = 1
+    bounds = [(0, None)] * k + [(None, None)] * n + [(risk_floor, None)]
+    weights = np.full(k, 1 / k)
+    lam = max(ratio(weights), 0.0)
+    status, iterations = "max_iterations", 0
+    for iterations in range(1, max_iterations + 1):
+        solution = linprog(np.concatenate([-gains, np.zeros(n), [lam]]), A_ub=a_ub, b_ub=b_ub, A_eq=a_eq,
+                           b_eq=[1.0], bounds=bounds, method="highs")
+        if solution.status != 0:
+            return None, {"status":f"lp_failed: {solution.message}", "iterations":iterations}
+        candidate = np.clip(solution.x[:k], 0, None)
+        candidate /= candidate.sum()
+        if ratio(candidate) >= ratio(weights):
+            weights = candidate
+        if float(gains @ candidate) - lam * drawdown(candidate) <= tolerance * max(1.0, lam):
+            status = "optimal"
+            break
+        lam = ratio(candidate)
+    return weights, {"status":status, "iterations":iterations, "ratio":ratio(weights),
+                     "equal_weight_ratio":ratio(np.full(k, 1 / k)),
+                     "effective_groups":float(1 / np.sum(weights ** 2))}

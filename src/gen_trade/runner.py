@@ -15,7 +15,7 @@ import pandas as pd
 from . import __version__
 from .backtest import ExecutionConfig, run_backtest
 from .data import ChromosomeContext, align_features, validate_bars
-from .experiments import (DEPLOY_POLICIES, METHOD_NAMES, ExperimentJob, NoEligibleConfiguration, candidates_for,
+from .experiments import (DEPLOY_POLICIES, METHOD_NAMES, VALIDATION_METRICS, ExperimentJob, NoEligibleConfiguration, candidates_for,
                           finish_experiment, finish_or_cash, pooled_choice, run_experiment, run_experiment_or_cash,
                           run_trials)
 from .parallel import process_pool
@@ -32,9 +32,9 @@ def exposure_controls(name, result, baseline, test, execution, *, periods_per_ye
 
     Reports the capital-weighted time in market, a HAC alpha/beta regression on
     next-open buy-and-hold, paired tests against buy-and-hold and against a
-    static cash/buy-and-hold blend with the same mean exposure, and (for
-    single-position methods) the rank of the net return among random entry
-    times with the same holding durations and costs.
+    static cash/buy-and-hold blend with the same mean exposure, and the rank
+    of the net return among random entry times with the same holding
+    durations and costs (per sleeve for portfolios; see ``random_timing``).
     """
     exposure = exposure_path(result)
     mean_exposure = float(exposure.mean()) if exposure.size else 0.0
@@ -47,28 +47,69 @@ def exposure_controls(name, result, baseline, test, execution, *, periods_per_ye
                                                                  bootstrap_reps=bootstrap_reps, seed=seed),
                 "exposure_matched_blend_net_return":float(blend.equity[-1]/blend.equity[0]-1),
                 "random_timing":None}
-    if name == "igtsp_ring":
-        controls["random_timing_note"] = "Not computed for multi-sleeve portfolios; use the exposure-matched blend."
-        return controls
-    rng = np.random.default_rng([seed, 7919])
-    signals = random_interval_signals(result.trades, len(test), random_reps, rng)
-    if signals is None:
-        controls["random_timing_note"] = "No trades (or no room to place them); random timing undefined."
-        return controls
-    plain = replace(execution, max_holding_days=None, take_profit=None, stop_loss=None)
-    if plain.instrument is not None:
-        from .market_execution import MarketArrays, execute_batch
-        outcome = execute_batch(MarketArrays.from_bars(test, plain.instrument), signals, plain)
-        random_returns = outcome.terminal_equity / plain.initial_cash - 1
+    timing, note = random_timing(result, test, execution, reps=random_reps, seed=seed,
+                                 portfolio=name == "igtsp_ring")
+    if timing is None:
+        controls["random_timing_note"] = note
     else:
-        random_returns = np.array([run_backtest(test, signals[:, i], plain).total_return for i in range(random_reps)])
-    actual = float(result.total_return)
-    controls["random_timing"] = {"reps":random_reps, "method_net_return":actual,
-        "random_median_net_return":float(np.median(random_returns)),
-        "percentile":float(np.mean(random_returns <= actual)),
-        "one_sided_pvalue":float((1 + np.sum(random_returns >= actual)) / (random_reps + 1)),
-        "construction":"same holding durations and trade count, random placement, same costs; exits replayed exactly"}
+        controls["random_timing"] = timing
     return controls
+
+
+def random_timing(result, test, execution, *, reps=200, seed=0, portfolio=False) -> tuple[dict | None, str | None]:
+    """Rank a held-out net return among random placements of the same trades.
+
+    Single-position methods replay their holding durations at random times.
+    EXTENSION (review 2026-11-05): portfolios do this independently in every
+    active sleeve, each with its own allocation, and sum the sleeves plus the
+    unused capital, so exposure, trade counts and durations match exactly.
+    """
+    rng = np.random.default_rng([seed, 7919])
+    plain = replace(execution, max_holding_days=None, take_profit=None, stop_loss=None)
+    initial = float(plain.initial_cash)
+    if portfolio:
+        sleeves = {}
+        for trade in result.trades:
+            sleeves.setdefault(trade.strategy_id, []).append(trade)
+        if not sleeves:
+            return None, "No trades (or no room to place them); random timing undefined."
+        blocks, capital = [], []
+        for name in sorted(sleeves, key=str):
+            signals = random_interval_signals(sleeves[name], len(test), reps, rng)
+            if signals is None:
+                return None, f"Sleeve {name} has no room to re-place its trades; random timing undefined."
+            blocks.append(signals)
+            capital.append(float(sleeves[name][0].allocation_fraction))
+        allocations = np.asarray(capital)
+        if plain.instrument is not None:
+            from .market_execution import MarketArrays, execute_batch
+            outcome = execute_batch(MarketArrays.from_bars(test, plain.instrument), np.hstack(blocks), plain,
+                                    initial_cash=np.repeat(allocations * initial, reps))
+            terminal = outcome.terminal_equity.reshape(len(blocks), reps).sum(axis=0)
+        else:
+            terminal = np.zeros(reps)
+            for weight, signals in zip(allocations, blocks):
+                terminal += weight * np.array([run_backtest(test, signals[:, i], plain).equity[-1] for i in range(reps)])
+        random_returns = (terminal + initial * (1 - allocations.sum())) / initial - 1
+        construction = ("each active sleeve replays its own holding durations and trade count at random times with its "
+                        "allocation and the same costs; idle capital stays in cash")
+    else:
+        signals = random_interval_signals(result.trades, len(test), reps, rng)
+        if signals is None:
+            return None, "No trades (or no room to place them); random timing undefined."
+        if plain.instrument is not None:
+            from .market_execution import MarketArrays, execute_batch
+            outcome = execute_batch(MarketArrays.from_bars(test, plain.instrument), signals, plain)
+            random_returns = outcome.terminal_equity / initial - 1
+        else:
+            random_returns = np.array([run_backtest(test, signals[:, i], plain).total_return for i in range(reps)])
+        construction = "same holding durations and trade count, random placement, same costs; exits replayed exactly"
+    actual = float(result.total_return)
+    return {"reps":reps, "method_net_return":actual,
+            "random_median_net_return":float(np.median(random_returns)),
+            "percentile":float(np.mean(random_returns <= actual)),
+            "one_sided_pvalue":float((1 + np.sum(random_returns >= actual)) / (reps + 1)),
+            "construction":construction}, None
 
 
 @dataclass(frozen=True)
@@ -135,9 +176,10 @@ def synthetic_markets(n: int = 480, seed: int = 42) -> dict[str, pd.DataFrame]:
 def protocol_header(*, train_bars, test_bars, embargo_bars, validation_bars, on_no_eligible, fold_plan, instrument,
                     initial_cash, stress_instrument, population_size, generations, periods_per_year, fee, slippage_bps,
                     workers, island_workers, configs, selection, deploy, min_validation_trades, validation_curves,
-                    exposure_controls_enabled) -> dict:
+                    exposure_controls_enabled, validation_metric="log_wealth_minus_drawdown") -> dict:
     """The report's declared protocol block (also used to audit saved reports)."""
-    return {"train_bars":train_bars if fold_plan is None else None,
+    extension = {} if validation_metric == "log_wealth_minus_drawdown" else {"validation_metric":validation_metric}
+    return {**extension,"train_bars":train_bars if fold_plan is None else None,
             "test_bars":test_bars if fold_plan is None else None,"embargo_bars":embargo_bars,
             "validation_bars":validation_bars if fold_plan is None else None,
             "on_no_eligible":on_no_eligible,
@@ -171,6 +213,7 @@ def compare_methods(
     on_no_eligible: str = 'raise',
     selection: str = "per_seed", deploy: str = "refit", min_validation_trades: int = 1,
     validation_curves: bool = False, exposure_controls_enabled: bool = False, random_timing_reps: int = 200,
+    validation_metric: str = "log_wealth_minus_drawdown",
 ) -> dict:
     """Compare documented adaptations; common costs/settings, frozen training fits.
 
@@ -188,6 +231,8 @@ def compare_methods(
         raise ValueError(f"selection must be one of {SELECTION_SCOPES}; deploy one of {DEPLOY_POLICIES}")
     if type(min_validation_trades) is not int or min_validation_trades < 1:
         raise ValueError("min_validation_trades must be a positive integer")
+    if validation_metric not in VALIDATION_METRICS:
+        raise ValueError(f"validation_metric must be one of {VALIDATION_METRICS}")
     if workers > 1 and island_workers > 1:
         raise ValueError("Use workers=1 for parallel islands; avoid nested experiment/island process pools")
     if not np.isfinite(periods_per_year) or periods_per_year <= 0:
@@ -258,7 +303,8 @@ def compare_methods(
                                     periods_per_year=periods_per_year,fee=fee,slippage_bps=slippage_bps,workers=workers,
                                     island_workers=island_workers,configs=configs,selection=selection,deploy=deploy,
                                     min_validation_trades=min_validation_trades,validation_curves=validation_curves,
-                                    exposure_controls_enabled=exposure_controls_enabled),
+                                    exposure_controls_enabled=exposure_controls_enabled,
+                                    validation_metric=validation_metric),
         "folds":[],
     }
     pending = []
@@ -290,7 +336,8 @@ def compare_methods(
                                     fold.test_start-fold.train_start, population_size, generations, fold_seed,
                                     executions[name],configs[name],island_workers,
                                     replace(executions[name],instrument=stress_instrument,slippage_bps=slippage_bps*2)
-                                    if stress_instrument else None, deploy, min_validation_trades, validation_curves)
+                                    if stress_instrument else None, deploy, min_validation_trades, validation_curves,
+                                    validation_metric)
                 pending.append((record_index, name, job))
     pool = process_pool(min(workers, len(pending))) if workers > 1 else None
     run_job=run_experiment_or_cash if on_no_eligible=='cash' else run_experiment

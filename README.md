@@ -177,7 +177,14 @@ in [docs/EXTENSIONS.md](docs/EXTENSIONS.md). Defaults stay paper-faithful:
 
 ```bash
 gen-trade benchmark --protocol audited --method-profile improved --output reports/audited-improved
+# Review 2026-11-05: blend-excess fitness and validation, tests against the exposure-matched blend
+gen-trade benchmark --protocol audited2 --method-profile robust --output reports/audited2-robust
+gen-trade reanalyze reports/audited-improved --output reports/audited-improved-reanalysis --data-directory data/stocks-fx-2015-2025
 ```
+
+`lockbox.json` holds out test years from 2026 (and any listed instruments); the
+benchmark refuses them unless `--unlock-lockbox` runs a profile that still matches
+its frozen hash (`gen-trade freeze-profiles`).
 
 ## Statistical scope
 

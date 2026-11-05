@@ -17,7 +17,10 @@ t-statistic of training trades in excess of an annual risk-free rate prorated
 over the training span (audit item 10); ``sign_adjusted`` applies Israelsen's
 (2005) refinement for negative numerators; ``mutation="lognormal"`` replaces
 the uniform one-gene redraw (expected new vote share 1 - ln 2) with a
-multiplicative heavy-tailed step.
+multiplicative heavy-tailed step. Review 2026-11-05: ``fitness="blend_excess"``
+scores the information ratio of daily excess over an exposure-matched blend on
+a fresh random half of the training months each generation
+(methods/robust_fitness.py), with an optional ``min_trades_per_year`` floor.
 """
 from __future__ import annotations
 
@@ -79,7 +82,7 @@ def _vote_totals(buy: np.ndarray, sell: np.ndarray, hold: np.ndarray, active: np
     return signals
 
 
-FITNESS_VARIANTS = ("paper", "tstat")
+FITNESS_VARIANTS = ("paper", "tstat", "blend_excess")
 MUTATION_VARIANTS = ("paper", "lognormal")
 
 
@@ -222,7 +225,8 @@ class MSTGAM:
                  execution: ExecutionConfig | None = None,
                  crossover_probability: float = 0.95, risk_free_return: float = 0.025, *,
                  fitness: str = "paper", sign_adjusted: bool = False, mutation: str = "paper",
-                 mutation_scale: float = 0.5):
+                 mutation_scale: float = 0.5, min_trades_per_year: float | None = None,
+                 subwindow_fraction: float = 0.5):
         if fitness not in FITNESS_VARIANTS:
             raise ValueError(f"fitness must be one of {FITNESS_VARIANTS}")
         if mutation not in MUTATION_VARIANTS:
@@ -230,6 +234,12 @@ class MSTGAM:
         if not np.isfinite(mutation_scale) or mutation_scale <= 0:
             raise ValueError("mutation_scale must be positive")
         self.fitness, self.sign_adjusted, self.mutation = fitness, bool(sign_adjusted), mutation
+        if min_trades_per_year is not None and (not np.isfinite(min_trades_per_year) or min_trades_per_year < 0):
+            raise ValueError("min_trades_per_year must be finite and nonnegative or None")
+        if not np.isfinite(subwindow_fraction) or not 0 < subwindow_fraction <= 1:
+            raise ValueError("subwindow_fraction must be in (0,1]")
+        self.min_trades_per_year = None if min_trades_per_year is None else float(min_trades_per_year)
+        self.subwindow_fraction = float(subwindow_fraction)
         self.mutation_scale = float(mutation_scale)
         for name, value, lower in (("population_size", population_size, 2),
                                    ("generations", generations, 0), ("seed", seed, 0),
@@ -300,9 +310,43 @@ class MSTGAM:
         self._cache_hits+=len(keys)-len(missing)
         return [self._fitness_cache[key] for key in keys]
 
+    def _fill_paths(self, frame, signals) -> list[bytes]:
+        """EXTENSION: cache each distinct action path's per-bar net return,
+        invested flag and completed-trade count (full training window)."""
+        from .robust_fitness import period_returns
+        keys = [np.asarray(signal, dtype=np.int8).tobytes() for signal in signals]
+        missing = {key:signal for key, signal in zip(keys, signals) if key not in self._paths}
+        if missing:
+            matrix = np.column_stack(list(missing.values()))
+            if self.execution.instrument is not None:
+                from ..market_execution import execute_batch
+                outcome = execute_batch(self._prepared_market, matrix, self.execution, record_equity=True,
+                                        record_exposure=True)
+                returns, held, counts = period_returns(outcome.equity), outcome.held, outcome.trade_counts
+            else:
+                from ..statistics import exposure_path
+                results = [run_backtest(frame, matrix[:, i], self.execution) for i in range(matrix.shape[1])]
+                returns = np.column_stack([period_returns(r.equity) for r in results])
+                held = np.column_stack([exposure_path(r) for r in results])
+                counts = [len(r.trades) for r in results]
+            for i, key in enumerate(missing):
+                self._paths[key] = (returns[:, i].astype(np.float32), held[:, i].astype(np.float32), int(counts[i]))
+        self._cache_hits += len(keys) - len(missing)
+        return keys
+
+    def _excess_scores(self, keys, mask) -> list[tuple[float, int]]:
+        from .robust_fitness import excess_information_ratio
+        returns = np.column_stack([self._paths[key][0] for key in keys])
+        held = np.column_stack([self._paths[key][1] for key in keys])
+        counts = np.asarray([self._paths[key][2] for key in keys])
+        scores = excess_information_ratio(returns, held, self._benchmark, mask, periods_per_year=self._periods_per_year)
+        scores = np.where(counts >= self._minimum_trades, np.clip(scores, -1e9, 1e9), INVALID_FITNESS)
+        return [(float(s), int(c)) for s, c in zip(scores, counts)]
+
     def _trade_score(self, count: int, total: float, population_std: float) -> float:
+        # blend_excess searches the weights; threshold calibration keeps the t-statistic.
         return trade_fitness(count, total, population_std, risk_free_return=self.risk_free_return,
-                             variant=self.fitness, sign_adjusted=self.sign_adjusted,
+                             variant="tstat" if self.fitness == "blend_excess" else self.fitness, sign_adjusted=self.sign_adjusted,
                              years=getattr(self, "_training_years", 1.0))
 
     def _mutate(self, child: np.ndarray, rng: np.random.Generator) -> None:
@@ -401,6 +445,15 @@ class MSTGAM:
             self._prepared_market=MarketArrays.from_bars(frame,self.execution.instrument)
         times, times_ns = self._clock(frame)
         self._training_years = max(float(times[-1] - times[0]) / (365.25 * 86400), 1e-9)
+        excess = self.fitness == "blend_excess"
+        if excess:
+            from .robust_fitness import SubWindows, bar_months, benchmark_returns, periods_per_year
+            self._paths = {}
+            self._benchmark = benchmark_returns(frame, self.execution, getattr(self, "_prepared_market", None))
+            self._periods_per_year = periods_per_year(frame)
+            sampler = SubWindows(bar_months(frame), self.seed, self.subwindow_fraction)
+            self._minimum_trades = 2 if self.min_trades_per_year is None else max(
+                2, int(np.ceil(self.min_trades_per_year * self._training_years)))
         prices = frame["close"].to_numpy()
         features = [_profile_features(prices, times, theta) for theta in THRESHOLDS]
         self.calibration_ = self._calibrate(frame, features, times)
@@ -417,7 +470,10 @@ class MSTGAM:
             # Batch all votes, then reuse simulator results for identical actions.
             buy, sell, hold = population @ buy_mask, population @ sell_mask, population @ hold_mask
             all_signals = _vote_totals(buy, sell, hold, active)
-            evaluations = self._score_many(frame,all_signals)
+            if excess:
+                evaluations = self._excess_scores(self._fill_paths(frame, all_signals), sampler.mask(generation))
+            else:
+                evaluations = self._score_many(frame,all_signals)
             scores = np.asarray([value[0] for value in evaluations])
             elite_index = int(np.argmax(scores))
             if scores[elite_index] > best_score:
@@ -446,22 +502,49 @@ class MSTGAM:
                     self._mutate(child, rng)
                 children.append(normalise_weights(child))
             population = np.asarray(children)
+        haircut = None
+        if excess:
+            # Sub-window scores differ per generation, so the deployed weights are
+            # the final population's best on the FULL training window.
+            buy, sell, hold = population @ buy_mask, population @ sell_mask, population @ hold_mask
+            keys = self._fill_paths(frame, _vote_totals(buy, sell, hold, active))
+            final = self._excess_scores(keys, None)
+            best_index = int(np.argmax([value[0] for value in final]))
+            best_score, best_trades = final[best_index]
+            best_weights = population[best_index].copy() if best_score > INVALID_FITNESS else None
+            from .robust_fitness import excess_paths, selection_haircut
+            pool = [key for key, value in self._paths.items() if value[2] >= self._minimum_trades]
+            if best_weights is not None and keys[best_index] in pool:
+                paths = excess_paths(np.column_stack([self._paths[k][0] for k in pool]),
+                                     np.column_stack([self._paths[k][1] for k in pool]), self._benchmark)
+                haircut = selection_haircut(paths, pool.index(keys[best_index]),
+                                            periods_per_year=self._periods_per_year, seed=self.seed)
+                haircut["scope"] = "every distinct evaluated action path meeting the trade floor"
         self._diagnostics = {
             "training_rows": len(frame), "training_end": frame["available_at"].iloc[-1].isoformat(),
-            "fitness": "paper_trade_sharpe_eq9_ddof0" if self.fitness == "paper" else "extension_trade_tstat_prorated_rf",
+            "fitness": {"paper":"paper_trade_sharpe_eq9_ddof0", "tstat":"extension_trade_tstat_prorated_rf",
+                        "blend_excess":"extension_excess_over_blend_information_ratio_subwindows"}[self.fitness],
             "variant": {"fitness": self.fitness, "sign_adjusted": self.sign_adjusted, "mutation": self.mutation,
                         "training_years": self._training_years},
             "best_fitness": float(best_score),
             "best_closed_trades": best_trades, "generation_best": history,
-            "unique_signal_evaluations": len(self._fitness_cache), "fitness_cache_hits": self._cache_hits,
+            "unique_signal_evaluations": len(self._paths) if excess else len(self._fitness_cache),
+            "fitness_cache_hits": self._cache_hits,
             "ignored_external_features": ignored,
         }
+        if excess:
+            self._diagnostics["variant"].update(minimum_completed_trades=self._minimum_trades,
+                                                subwindows=sampler.describe(), selection_haircut=haircut,
+                                                best_fitness_scope="final population on the full training window")
         if best_weights is None:
             raise ValueError("MSTGAM found no valid candidate: need at least two closed trades with nonzero return variance")
         self.weights_ = normalise_weights(best_weights)
         self._fitted = True
         # Fitness cache is fit-local, not an unbounded process-level market cache.
         self._fitness_cache.clear()
+        if excess:
+            self._paths = {}
+            del self._benchmark
         if hasattr(self,"_prepared_market"):
             del self._prepared_market
         return self
@@ -486,7 +569,8 @@ class MSTGAM:
             "crossover_probability": self.crossover_probability,
             "risk_free_return": self.risk_free_return, "execution": asdict(self.execution),
             "fitness": self.fitness, "sign_adjusted": self.sign_adjusted, "mutation": self.mutation,
-            "mutation_scale": self.mutation_scale,
+            "mutation_scale": self.mutation_scale, "min_trades_per_year": self.min_trades_per_year,
+            "subwindow_fraction": self.subwindow_fraction,
             "weights": self.weights_.tolist(), "thresholds": list(THRESHOLDS),
             "genes": [{"strategy": strategy, "threshold_index": index} for strategy, index in GENES],
             "calibration": [asdict(item) for item in self.calibration_],
