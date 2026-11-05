@@ -31,7 +31,7 @@ def main(argv=None) -> int:
     benchmark.add_argument('--embargo-bars',type=int,default=5)
     benchmark.add_argument('--symbols',nargs='+',help='Optional subset of the downloaded universe')
     benchmark.add_argument('--no-resume',action='store_true')
-    benchmark.add_argument('--method-profile',choices=('paper','improved','robust'),default='paper',
+    benchmark.add_argument('--method-profile',choices=('paper','improved','robust','robust_weekly','robust_monthly'),default='paper',
                            help='paper-faithful candidates, or labeled extension variants (docs/EXTENSIONS.md)')
     benchmark.add_argument('--method-configs',type=Path,help='JSON mapping every method to its candidate list (profile "custom")')
     benchmark.add_argument('--protocol',choices=('original','audited','audited2'),default='original',

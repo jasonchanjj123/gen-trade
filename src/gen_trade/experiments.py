@@ -43,7 +43,26 @@ ROBUST_CANDIDATES = {
     "mstgam": ({**_MSTGAM_ROBUST, "min_votes":3}, {**_MSTGAM_ROBUST, "min_votes":2}),
     "igtsp_ring": ({**_RING_ROBUST, "groups":12}, {**_RING_ROBUST, "groups":17}),
 }
-CANDIDATE_PROFILES = {"paper":DEFAULT_CANDIDATES, "improved":IMPROVED_CANDIDATES, "robust":ROBUST_CANDIDATES}
+# Results 2026-11-05 profiles: the robust search with weekly or monthly
+# decisions (methods/cadence.py). MSTGAM's inert min_votes knob is replaced by a
+# vote-margin hurdle that changes the model; monthly runs use a trade floor of
+# one per year, since at most about one round trip a month is possible.
+def _cadence_profile(cadence: str, floor: float) -> dict:
+    def adjust(config):
+        updated = {**config, "decision_cadence":cadence}
+        if "min_trades_per_year" in updated:
+            updated["min_trades_per_year"] = floor
+        return updated
+    mstgam = {**_MSTGAM_ROBUST, "decision_cadence":cadence, "min_trades_per_year":floor}
+    return {"moo3":tuple(adjust(c) for c in ROBUST_CANDIDATES["moo3"]),
+            "mstgam":({**mstgam, "vote_margin":.1}, {**mstgam, "vote_margin":.25}),
+            "igtsp_ring":tuple(adjust(c) for c in ROBUST_CANDIDATES["igtsp_ring"])}
+
+
+ROBUST_WEEKLY_CANDIDATES = _cadence_profile("weekly", 3.)
+ROBUST_MONTHLY_CANDIDATES = _cadence_profile("monthly", 1.)
+CANDIDATE_PROFILES = {"paper":DEFAULT_CANDIDATES, "improved":IMPROVED_CANDIDATES, "robust":ROBUST_CANDIDATES,
+                      "robust_weekly":ROBUST_WEEKLY_CANDIDATES, "robust_monthly":ROBUST_MONTHLY_CANDIDATES}
 VALIDATION_METRICS = ("log_wealth_minus_drawdown", "blend_excess")
 DEPLOY_POLICIES = ("refit", "validated")
 

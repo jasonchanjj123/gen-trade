@@ -219,7 +219,7 @@ def test_blend_excess_validation_score_and_protocol_header():
 
 
 def test_profiles_keep_paper_and_improved_unchanged():
-    assert set(CANDIDATE_PROFILES) == {"paper", "improved", "robust"}
+    assert {"paper", "improved", "robust"} <= set(CANDIDATE_PROFILES)
     assert IMPROVED_CANDIDATES["igtsp_ring"][0]["fitness"] == "mixture_drawdown"
     assert all(c["fitness"] == "blend_excess" for c in ROBUST_CANDIDATES["mstgam"] + ROBUST_CANDIDATES["igtsp_ring"])
 
@@ -275,3 +275,87 @@ def test_pooled_controls_cluster_by_year():
     timing = rows[0]["random_timing_percentile"]
     assert rows[0]["instrument_years"] == 6 and timing["cells"] == 6 and timing["years"] == 3
     assert np.isclose(timing["mean"], .7) and timing["above_reference"] == 6
+
+
+# --- results 2026-11-05: cadence, vote margin, Ring haircut scope -------------------
+
+from gen_trade.methods.cadence import apply_cadence, decision_bars
+from gen_trade.methods.mstgam import aggregate_signals
+from gen_trade.experiments import ROBUST_MONTHLY_CANDIDATES, ROBUST_WEEKLY_CANDIDATES
+
+
+def test_decision_bars_open_each_week_and_month():
+    times = pd.bdate_range("2024-01-01", periods=70, tz="UTC")
+    weekly, monthly = decision_bars(times, "weekly"), decision_bars(times, "monthly")
+    assert weekly[0] and all(times[i].weekday() == 0 for i in np.flatnonzero(weekly)[1:])
+    assert all(times[i].month != times[i - 1].month for i in np.flatnonzero(monthly)[1:])
+    assert decision_bars(times, "daily").all()
+
+
+def test_cadence_carries_the_latest_signal_and_is_causal():
+    times = pd.bdate_range("2024-01-01", periods=30, tz="UTC")
+    rng = np.random.default_rng(7)
+    signals = rng.choice(np.array([-1, 0, 1], dtype=np.int8), size=(30, 6), p=[.15, .7, .15])
+    out = apply_cadence(signals, times, "weekly")
+    decision = decision_bars(times, "weekly")
+    assert not out[~decision].any()
+    points = np.flatnonzero(decision)
+    for previous, current in zip(points[:-1], points[1:]):
+        for column in range(signals.shape[1]):
+            window = signals[previous + 1:current + 1, column]
+            raised = window[window != 0]
+            assert out[current, column] == (raised[-1] if raised.size else 0)
+    changed = signals.copy(); changed[20:] = -changed[20:]
+    assert np.array_equal(apply_cadence(changed, times, "weekly")[:20], out[:20])
+    assert np.array_equal(apply_cadence(signals.T, times, "weekly", axis=1), out.T)
+    assert apply_cadence(signals, times, "daily") is signals
+
+
+def test_vote_margin_is_a_hurdle_and_zero_keeps_the_paper_rule():
+    rng = np.random.default_rng(0)
+    opinions = rng.choice(np.array([-1, 0, 1], dtype=np.int8), size=(500, 70))
+    weights = rng.uniform(size=70)
+    paper = aggregate_signals(opinions, weights)
+    assert np.array_equal(aggregate_signals(opinions, weights, vote_margin=0.0), paper)
+    counts = [np.count_nonzero(aggregate_signals(opinions, weights, vote_margin=m)) for m in (0, .05, .1, .2)]
+    assert counts == sorted(counts, reverse=True) and counts[-1] < counts[0]
+    hurdle = aggregate_signals(opinions, weights, vote_margin=.1)
+    assert np.all((hurdle == 0) | (hurdle == paper))
+
+
+@pytest.mark.parametrize("cadence", ["weekly", "monthly"])
+def test_methods_only_act_on_decision_bars(cadence):
+    bars = candles(600, seed=4)
+    decision = decision_bars(bars["timestamp"], cadence)
+    floor = 3. if cadence == "weekly" else 1.
+    mstgam = MSTGAM(population_size=8, generations=2, seed=1, execution=execution(), fitness="blend_excess",
+                    min_trades_per_year=floor, vote_margin=.1, decision_cadence=cadence).fit(bars)
+    moo3 = MOO3(population_size=16, generations=2, seed=1, execution=execution(max_holding_days=5, take_profit=.05),
+                objectives="blend_excess", min_trades_per_year=floor, feature_transform="scale_free",
+                decision_cadence=cadence).fit(bars)
+    ring = IGTSPRing(population_size=8, generations=2, seed=3, island_count=2, groups=3, strategy_count=6,
+                     execution=execution(), fitness="blend_excess", weight_mode="equal",
+                     decision_cadence=cadence).fit(bars)
+    for signals in (mstgam.predict(bars), moo3.predict(bars), ring.predict(bars).signals):
+        values = np.asarray(signals).reshape(len(bars), -1)
+        assert not values[~decision].any()
+    for model in (mstgam, moo3, ring):
+        assert model.parameters()["decision_cadence"] == cadence
+
+
+def test_ring_haircut_covers_every_final_stage_evaluation():
+    model = IGTSPRing(population_size=8, generations=4, seed=3, island_count=2, groups=3, strategy_count=6,
+                      execution=execution(), fitness="blend_excess", weight_mode="equal").fit(candles(600, seed=5))
+    haircut = model.diagnostics["variant"]["selection_haircut"]
+    assert haircut["scope"] == "every chromosome evaluated in the final stage"
+    assert haircut["candidates"] > 8  # more than the final population
+    assert haircut["candidates"] <= model.diagnostics["unique_evaluations"]
+
+
+def test_cadence_profiles_replace_the_inert_mstgam_knob():
+    for profile, cadence, floor in ((ROBUST_WEEKLY_CANDIDATES, "weekly", 3.), (ROBUST_MONTHLY_CANDIDATES, "monthly", 1.)):
+        assert all(c["decision_cadence"] == cadence for name in profile for c in profile[name])
+        assert [c["vote_margin"] for c in profile["mstgam"]] == [.1, .25]
+        assert all("min_votes" not in c and c["min_trades_per_year"] == floor for c in profile["mstgam"])
+        assert all(c["min_trades_per_year"] == floor for c in profile["moo3"])
+    assert set(CANDIDATE_PROFILES) >= {"robust_weekly", "robust_monthly"}

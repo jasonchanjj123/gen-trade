@@ -28,6 +28,9 @@ excess over an exposure-matched blend on a fresh random half of the training
 months each generation, minus ``complexity_penalty`` per tree node. Scalar
 objectives fill all three slots, so Pareto rank equals score order, survival
 is plain NSGA-II truncation and the final pick is the best score.
+``decision_cadence="weekly"|"monthly"`` acts only at the first bar of each
+period on the latest signal raised since the last decision (methods/cadence.py),
+in training and prediction alike.
 """
 from __future__ import annotations
 
@@ -40,6 +43,7 @@ import numpy as np
 import pandas as pd
 
 from ..backtest import ExecutionConfig, run_backtest
+from .cadence import DECISION_CADENCES, apply_cadence
 from .indicators import FEATURE_TRANSFORMS, FeatureScaler, feature_families, raw_features
 
 OBJECTIVE_SETS = ("paper", "robust", "single", "blend_excess")
@@ -292,7 +296,7 @@ class MOO3:
         objectives: str = "paper", min_trades_per_year: float | None = None,
         lcb_z: float = 1.0, survival: str = "nsga2", feature_transform: str = "paper",
         threshold_volatility_multiple: float | None = None, complexity_penalty: float = 0.0,
-        subwindow_fraction: float = 0.5,
+        subwindow_fraction: float = 0.5, decision_cadence: str = "daily",
     ):
         if objectives not in OBJECTIVE_SETS:
             raise ValueError(f"objectives must be one of {OBJECTIVE_SETS}")
@@ -315,6 +319,9 @@ class MOO3:
         if not np.isfinite(subwindow_fraction) or not 0 < subwindow_fraction <= 1:
             raise ValueError("subwindow_fraction must be in (0,1]")
         self.complexity_penalty, self.subwindow_fraction = float(complexity_penalty), float(subwindow_fraction)
+        if decision_cadence not in DECISION_CADENCES:
+            raise ValueError(f"decision_cadence must be one of {DECISION_CADENCES}")
+        self.decision_cadence = decision_cadence
         self.threshold_volatility_multiple = (None if threshold_volatility_multiple is None
                                               else float(threshold_volatility_multiple))
         if type(population_size) is not int or population_size < 4:
@@ -389,6 +396,10 @@ class MOO3:
         raw = raw_features(bars, self.fitted_threshold_, extra_features, transform=self.feature_transform)
         groups = feature_families(raw) if self.feature_transform == "scale_free" else None
         self._scaler = FeatureScaler.fit(raw, groups)
+        stamps = bars["timestamp"]
+
+        def decide(values):
+            return apply_cadence(values, stamps, self.decision_cadence)
         features = self._scaler.transform(raw)
         names = tuple(features)
         rng = np.random.default_rng(self.seed)
@@ -417,7 +428,7 @@ class MOO3:
                 prepared_market=MarketArrays.from_bars(bars,self.execution.instrument)
             missing=list(dict.fromkeys(tree for tree in trees if tree not in cache))
             if missing:
-                decisions=np.column_stack([evaluate_tree(tree,features,len(bars)).astype(np.int8) for tree in missing])
+                decisions=decide(np.column_stack([evaluate_tree(tree,features,len(bars)).astype(np.int8) for tree in missing]))
                 outcomes=execute_batch(prepared_market,decisions,self.execution)
                 for i,tree in enumerate(missing):
                     count=int(outcomes.trade_counts[i])
@@ -431,7 +442,7 @@ class MOO3:
 
         def individual(tree):
             if tree not in cache:
-                signals = evaluate_tree(tree, features, len(bars)).astype(np.int8)
+                signals = decide(evaluate_tree(tree, features, len(bars)).astype(np.int8))
                 result = run_backtest(bars, signals, self.execution)
                 count = len(result.trade_returns)
                 returns = np.asarray(result.trade_returns, dtype=float)
@@ -457,7 +468,8 @@ class MOO3:
                 paths = excess_state["paths"]
                 missing = list(dict.fromkeys(tree for tree in trees if tree not in paths))
                 if missing:
-                    decisions = np.column_stack([evaluate_tree(tree, features, len(bars)).astype(np.int8) for tree in missing])
+                    decisions = decide(np.column_stack([evaluate_tree(tree, features, len(bars)).astype(np.int8)
+                                                        for tree in missing]))
                     if self.execution.instrument is not None:
                         from ..market_execution import MarketArrays, execute_batch
                         if prepared_market is None:
@@ -588,7 +600,8 @@ class MOO3:
             raise RuntimeError("MOO3 must be fitted before prediction")
         raw = raw_features(bars, self.fitted_threshold_, extra_features, transform=self.feature_transform)
         features = self._scaler.transform(raw)
-        return evaluate_tree(self._selected, features, len(bars)).astype(np.int8)
+        return apply_cadence(evaluate_tree(self._selected, features, len(bars)).astype(np.int8), bars["timestamp"],
+                             self.decision_cadence)
 
     def parameters(self) -> dict:
         return {"method": "moo3", "population_size": self.population_size, "generations": self.generations,
@@ -597,6 +610,7 @@ class MOO3:
                 "objectives": self.objectives, "min_trades_per_year": self.min_trades_per_year,
                 "lcb_z": self.lcb_z, "survival": self.survival, "feature_transform": self.feature_transform,
                 "complexity_penalty": self.complexity_penalty, "subwindow_fraction": self.subwindow_fraction,
+                "decision_cadence": self.decision_cadence,
                 "threshold_volatility_multiple": self.threshold_volatility_multiple,
                 "fitted_threshold": getattr(self, "fitted_threshold_", None),
                 "entry_rule": self._selected.to_dict() if self._selected is not None else None}

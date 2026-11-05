@@ -16,6 +16,9 @@ on marked-to-market daily sleeve equity instead of Eq.9 monthly trade
 averages; ``fitness="blend_excess"`` scores the mixture's excess over an
 exposure-matched blend on resampled training months; ``weight_mode`` chooses
 evolved ("ga"), equal ("equal") or LP-optimal ("lp", Dinkelbach) group weights.
+Results 2026-11-05: ``decision_cadence`` acts weekly or monthly on every bank
+strategy (methods/cadence.py), and the blend-excess selection haircut covers
+every chromosome evaluated in the final stage.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ import pandas as pd
 from ..backtest import ExecutionConfig, PortfolioSignals
 from ..data import validate_bars
 from ..parallel import process_pool
+from .cadence import DECISION_CADENCES, apply_cadence
 from .ring_bank import DEFAULT_BANK, INDICATORS, Strategy, strategy_signals
 from .ring_fitness import (FITNESS_VARIANTS, INVALID_FITNESS, MonthlyProfiles, PreparedMarket,
                            drawdown_ratio_weights, monthly_trade_profiles, portfolio_excess_fitness, portfolio_fitness)
@@ -292,6 +296,42 @@ class _Evaluator:
         return portfolio_fitness(chromosome, wealth, profile.trade_counts, risk_floor=self.risk_floor,
                                  ratio_cap=self.ratio_cap, variant=self.variant, sign_adjusted=self.sign_adjusted)
 
+    def key(self, chromosome):
+        linear = self.execution.instrument is None or self.execution.instrument.scale_invariant
+        return (chromosome.take_profit_bits, chromosome.stop_loss_bits) if linear else chromosome
+
+    def profiles_for(self, chromosomes) -> dict:
+        """Profiles for these chromosomes' exit policies, keyed like the cache.
+
+        Computed in blocks and returned directly, so the result never depends on
+        cache eviction (used to score every evaluated chromosome at the end).
+        """
+        wanted = {self.key(c):c for c in chromosomes}
+        found = {key:self.profiles[key] for key in wanted if key in self.profiles}
+        missing = [(key, c) for key, c in wanted.items() if key not in found]
+        if self.execution.instrument is None:
+            for key, c in missing:
+                tp, sl = c.thresholds(self.take_profit_limit, self.stop_loss_limit)
+                found[key] = monthly_trade_profiles(self.market, self.signals,
+                                                    replace(self.execution, take_profit=tp, stop_loss=sl), daily=self.daily)
+            return found
+        n = self.signals.shape[1]
+        linear = self.execution.instrument.scale_invariant
+        for offset in range(0, len(missing), 32):
+            block = missing[offset:offset+32]
+            thresholds = [c.thresholds(self.take_profit_limit, self.stop_loss_limit) for _, c in block]
+            capital = None if linear else np.concatenate([self.execution.initial_cash*c.allocations() for _, c in block])
+            batch = monthly_trade_profiles(self.market, np.tile(self.signals, (1, len(block))), self.execution,
+                                           initial_cash=capital, take_profit=np.repeat([v[0] for v in thresholds], n),
+                                           stop_loss=np.repeat([v[1] for v in thresholds], n), daily=self.daily)
+            for i, (key, _) in enumerate(block):
+                view = slice(i*n, (i+1)*n)
+                found[key] = MonthlyProfiles(batch.wealth[view], batch.trade_counts[view], batch.mean_returns[view],
+                                             batch.monthly_trade_counts[view], batch.months,
+                                             None if batch.daily_wealth is None else batch.daily_wealth[view],
+                                             None if batch.held is None else batch.held[view])
+        return found
+
     def profile(self, chromosome):
         """The (cached) bank profile under this chromosome's exit policy."""
         self.evaluate_many([chromosome])
@@ -346,12 +386,21 @@ class _Island:
     cache: dict[GroupChromosome, dict] = field(default_factory=dict)
     history: list[dict] = field(default_factory=list)
     best: list = field(default_factory=list)
+    # Every chromosome this island has scored (the cache is cleared each
+    # generation under stochastic fitness).
+    evaluated: set = field(default_factory=set)
+
+    def remember(self, chromosomes, metrics):
+        chromosomes = list(chromosomes)
+        self.cache.update(zip(chromosomes, metrics))
+        self.evaluated.update(chromosomes)
 
     def score(self, chromosome, evaluator=None):
         if chromosome not in self.cache:
             if evaluator is None:
                 raise ValueError("Migration needs evaluated chromosomes")
             self.cache[chromosome] = evaluator.evaluate(chromosome)
+            self.evaluated.add(chromosome)
         return self.cache[chromosome]["fitness"]
 
 
@@ -365,7 +414,7 @@ def _advance_island(island: _Island, evaluator: _Evaluator, steps: int, settings
         return island.score(c, evaluator)
     def precache(candidates):
         missing=list(dict.fromkeys(c for c in candidates if c not in island.cache))
-        island.cache.update(zip(missing,evaluator.evaluate_many(missing)))
+        island.remember(missing,evaluator.evaluate_many(missing))
     crossover_mode = settings.get("crossover_mode", "paper")
     mutation_mode = settings.get("mutation_mode", "paper")
     unique = settings.get("unique_children", False)
@@ -457,7 +506,7 @@ def ring_migrate(islands: list[_Island], count: int | None = None, *, migration_
         if evaluator is not None:
             for island in (left,right):
                 missing=list(dict.fromkeys(c for c in island.population if c not in island.cache))
-                island.cache.update(zip(missing,evaluator.evaluate_many(missing)))
+                island.remember(missing,evaluator.evaluate_many(missing))
         left.population.sort(key=lambda c:left.score(c, evaluator), reverse=True)
         right.population.sort(key=lambda c:right.score(c, evaluator), reverse=True)
         a, b = left.population[:amount], right.population[:amount]
@@ -511,9 +560,10 @@ class IGTSPRing:
                  fitness: str = "paper", sign_adjusted: bool = False, crossover_mode: str = "paper",
                  mutation_mode: str = "paper", unique_children: bool = False, bank_selection: str = "paper",
                  bank_ranking: str = "paper", migration_schedule: str = "paper", weight_mode: str = "ga",
-                 subwindow_fraction: float = 0.5):
+                 subwindow_fraction: float = 0.5, decision_cadence: str = "daily"):
         for name, value, allowed in (("fitness", fitness, FITNESS_VARIANTS), ("crossover_mode", crossover_mode, CROSSOVER_MODES),
                                      ("weight_mode", weight_mode, WEIGHT_MODES),
+                                     ("decision_cadence", decision_cadence, DECISION_CADENCES),
                                      ("mutation_mode", mutation_mode, MUTATION_MODES), ("bank_selection", bank_selection, BANK_SELECTIONS),
                                      ("bank_ranking", bank_ranking, BANK_RANKINGS),
                                      ("migration_schedule", migration_schedule, MIGRATION_SCHEDULES)):
@@ -524,6 +574,7 @@ class IGTSPRing:
         if not np.isfinite(subwindow_fraction) or not 0 < subwindow_fraction <= 1:
             raise ValueError("subwindow_fraction must be in (0,1]")
         self.weight_mode, self.subwindow_fraction = weight_mode, float(subwindow_fraction)
+        self.decision_cadence = decision_cadence
         for name, value, minimum in (("population_size",population_size,4), ("generations",generations,0),
                 ("seed",seed,0), ("island_count",island_count,2), ("groups",groups,2),
                 ("strategy_count",strategy_count,2), ("take_profit_bits",take_profit_bits,1),
@@ -660,7 +711,7 @@ class IGTSPRing:
             not any(rule.startswith(('obv:','mfi14:','adosc:')) for rule in (s.buy_rule,s.sell_rule)))
         if len(candidate_bank)<self.strategy_count:
             raise ValueError("Too few strategies remain after excluding unavailable volume rules")
-        pool_signals = strategy_signals(frame, candidate_bank)
+        pool_signals = apply_cadence(strategy_signals(frame, candidate_bank), frame["timestamp"], self.decision_cadence)
         # The text omits 'best n' ranking: declare return-first and risk/index tie-breaks.
         selected_indices = self._rank_bank(market, pool_signals, self.take_profit_limit, self.stop_loss_limit)
         seeds = np.random.SeedSequence(self.seed)
@@ -722,19 +773,27 @@ class IGTSPRing:
         haircut = None
         if self.fitness == "blend_excess":
             from .robust_fitness import excess_paths, period_returns, selection_haircut
-            final = list(dict.fromkeys(candidates))
-            columns = []
-            for chromosome in final:
-                profile = evaluator.profile(chromosome)
-                allocations = chromosome.allocations()
-                mixture = allocations @ profile.daily_wealth
-                columns.append((period_returns(mixture), allocations @ profile.held))
+            seen = {c for island in islands for c in island.evaluated} | set(candidates)
+            order = sorted(seen, key=lambda c:(c.take_profit_bits, c.stop_loss_bits, c.assignments, c.weight_bits))
+            by_key = {}
+            for chromosome in order:
+                by_key.setdefault(evaluator.key(chromosome), []).append(chromosome)
+            keys, columns, scored = list(by_key), [], []
+            for offset in range(0, len(keys), 32):
+                block = keys[offset:offset+32]
+                profiles = evaluator.profiles_for([by_key[key][0] for key in block])
+                for key in block:
+                    for chromosome in by_key[key]:
+                        allocations = chromosome.allocations()
+                        mixture = allocations @ profiles[key].daily_wealth
+                        columns.append((period_returns(mixture), allocations @ profiles[key].held))
+                        scored.append(chromosome)
             excess = excess_paths(np.column_stack([c[0] for c in columns]), np.column_stack([c[1] for c in columns]),
                                   evaluator.benchmark)
-            haircut = selection_haircut(excess, final.index(winner), periods_per_year=evaluator.periods_per_year,
+            haircut = selection_haircut(excess, scored.index(winner), periods_per_year=evaluator.periods_per_year,
                                         seed=self.seed)
-            haircut["scope"] = "final population of the last stage"
-        evaluated = {c for island in islands for c in island.cache}
+            haircut["scope"] = "every chromosome evaluated in the final stage"
+        evaluated = {c for island in islands for c in island.evaluated} | {c for island in islands for c in island.cache}
         self._diagnostics = {
             "method":"igtsp_ring", "source_doi":SOURCE_DOI, "source_pdf_sha256":SOURCE_PDF_SHA256,
             "fidelity":FIDELITY, "paper_fitness_verified":True, "fitness":"section_3.3.3_eq6_to_16"
@@ -788,7 +847,8 @@ class IGTSPRing:
             raise RuntimeError("Fit IGTSP-Ring before predicting")
         self._check_external(extra_features)
         tp, sl = self._selected.thresholds(self.take_profit_limit, self.stop_loss_limit)
-        return PortfolioSignals(tuple(s.name for s in self._bank), strategy_signals(bars,self._bank),
+        signals = apply_cadence(strategy_signals(bars,self._bank), validate_bars(bars)["timestamp"], self.decision_cadence)
+        return PortfolioSignals(tuple(s.name for s in self._bank), signals,
                                 tuple(float(x) for x in self.allocations()), 0., tp, sl)
 
     def allocations(self) -> np.ndarray:
@@ -831,6 +891,7 @@ class IGTSPRing:
                 "group_weights":(self._selected.group_weights() if self._group_weights is None
                                  else np.asarray(self._group_weights)).tolist(),
                 "weight_mode":self.weight_mode, "subwindow_fraction":self.subwindow_fraction,
+                "decision_cadence":self.decision_cadence,
                 "strategy_groups":[[self._bank[i].name for i in members] for members in self._selected.groups],
                 "bank":[asdict(strategy) for strategy in self._bank], "fitness_equations":"6-16",
                 "portfolio_policy":"held-out equity uses equal member sleeves within each group; evolved TPSL; no cash gene",

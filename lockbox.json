@@ -1,12 +1,14 @@
 {
-  "created": "2026-11-05T07:58:14.627938+00:00",
+  "created": "2026-11-05T11:11:15.931451+00:00",
   "first_test_year": 2026,
   "symbols": [],
   "frozen_profiles": {
     "improved": "97858e906fc95e5b498cb799ebfe0feac9fce8d8421c92485c56cc5110d7e043",
     "paper": "98d6dec0c19047580fb1975765a91791f52a41017d373a79daf515d618ce3cdc",
-    "robust": "b2420fa55432b475291a780401b72245f685e1c11bc96de43228a0cc8ea4c138"
+    "robust": "b2420fa55432b475291a780401b72245f685e1c11bc96de43228a0cc8ea4c138",
+    "robust_monthly": "5e1452a34c8f029f04e0b0c31eb2901bc16d236c66eaf933cec50f4c930f8cb9",
+    "robust_weekly": "7a1bdba12215f154a72fb0b37a7becd6f4d3cf67481ec7d9c4a9799ec06420ff"
   },
-  "code_sha256_at_freeze": "3597b7f61a071ee4aca0eff145ddd61c32d500e94ff8df3352ae54e366fd28fb",
-  "note": "Forward data from 2026 is held out. Add never-examined instruments with --symbols before fetching them."
+  "code_sha256_at_freeze": "cec665c9e04965105b127bc592d804a4103b72a8a118497936a1c7949a444ed1",
+  "note": "Forward data from 2026 is held out. Add never-examined instruments with --symbols before fetching them. Re-frozen 2026-11-05 to add robust_weekly/robust_monthly; lockbox still untouched."
 }

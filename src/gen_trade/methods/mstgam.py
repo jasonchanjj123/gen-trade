@@ -21,6 +21,9 @@ multiplicative heavy-tailed step. Review 2026-11-05: ``fitness="blend_excess"``
 scores the information ratio of daily excess over an exposure-matched blend on
 a fresh random half of the training months each generation
 (methods/robust_fitness.py), with an optional ``min_trades_per_year`` floor.
+Results 2026-11-05: ``vote_margin`` makes an action need a weighted buy-sell
+lead of at least that share of the vote (a hurdle that holds otherwise), and
+``decision_cadence`` acts weekly or monthly (methods/cadence.py).
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ import pandas as pd
 from gen_trade.backtest import ExecutionConfig, run_backtest
 from gen_trade.data import validate_bars
 from gen_trade.dc import DCProfile, directional_changes
+from gen_trade.methods.cadence import DECISION_CADENCES, apply_cadence
 
 
 THRESHOLDS = (0.00098, 0.0022, 0.0048, 0.0072, 0.0098,
@@ -53,7 +57,8 @@ def normalise_weights(weights: np.ndarray) -> np.ndarray:
     return values / total if total > 0 else np.full(values.size, 1.0 / values.size)
 
 
-def aggregate_signals(opinions: np.ndarray, weights: np.ndarray, min_votes: int = 3) -> np.ndarray:
+def aggregate_signals(opinions: np.ndarray, weights: np.ndarray, min_votes: int = 3,
+                      vote_margin: float = 0.0) -> np.ndarray:
     """Weighted Buy/Sell/Hold votes; active-count override and ties are explicit.
 
     Zero-weight genes still count toward the paper's active-gene threshold.
@@ -69,16 +74,18 @@ def aggregate_signals(opinions: np.ndarray, weights: np.ndarray, min_votes: int 
     sell = (opinion == -1) @ w
     hold = (opinion == 0) @ w
     active = np.count_nonzero(opinion, axis=1) >= min_votes
-    return _vote_totals(buy, sell, hold, active)
+    return _vote_totals(buy, sell, hold, active, vote_margin)
 
 
-def _vote_totals(buy: np.ndarray, sell: np.ndarray, hold: np.ndarray, active: np.ndarray) -> np.ndarray:
+def _vote_totals(buy: np.ndarray, sell: np.ndarray, hold: np.ndarray, active: np.ndarray,
+                 vote_margin: float = 0.0) -> np.ndarray:
     # A rounding residue in a unit-sum vector must not turn a mathematical tie
     # into an order. Use the same rule for batch fitting and single inference.
     eps = 16 * np.finfo(float).eps
     signals = np.zeros(buy.shape, dtype=np.int8)
-    signals[(buy > sell + eps) & (active | (buy > hold + eps))] = 1
-    signals[(sell > buy + eps) & (active | (sell > hold + eps))] = -1
+    # EXTENSION: vote_margin (default 0) is an entry/exit hurdle on the lead.
+    signals[(buy > sell + eps + vote_margin) & (active | (buy > hold + eps))] = 1
+    signals[(sell > buy + eps + vote_margin) & (active | (sell > hold + eps))] = -1
     return signals
 
 
@@ -226,7 +233,7 @@ class MSTGAM:
                  crossover_probability: float = 0.95, risk_free_return: float = 0.025, *,
                  fitness: str = "paper", sign_adjusted: bool = False, mutation: str = "paper",
                  mutation_scale: float = 0.5, min_trades_per_year: float | None = None,
-                 subwindow_fraction: float = 0.5):
+                 subwindow_fraction: float = 0.5, vote_margin: float = 0.0, decision_cadence: str = "daily"):
         if fitness not in FITNESS_VARIANTS:
             raise ValueError(f"fitness must be one of {FITNESS_VARIANTS}")
         if mutation not in MUTATION_VARIANTS:
@@ -240,6 +247,11 @@ class MSTGAM:
             raise ValueError("subwindow_fraction must be in (0,1]")
         self.min_trades_per_year = None if min_trades_per_year is None else float(min_trades_per_year)
         self.subwindow_fraction = float(subwindow_fraction)
+        if not np.isfinite(vote_margin) or not 0 <= vote_margin < 1:
+            raise ValueError("vote_margin must be in [0,1)")
+        if decision_cadence not in DECISION_CADENCES:
+            raise ValueError(f"decision_cadence must be one of {DECISION_CADENCES}")
+        self.vote_margin, self.decision_cadence = float(vote_margin), decision_cadence
         self.mutation_scale = float(mutation_scale)
         for name, value, lower in (("population_size", population_size, 2),
                                    ("generations", generations, 0), ("seed", seed, 0),
@@ -387,7 +399,8 @@ class MSTGAM:
         best = (candidates[0][0], candidates[1][0])
         best_score = INVALID_FITNESS
         pairs=[(down,up) for down in candidates[0] for up in candidates[1]]
-        signals=[_threshold_signal(f,values,down,up) for down,up in pairs]
+        signals=[apply_cadence(_threshold_signal(f,values,down,up),frame["timestamp"],self.decision_cadence)
+                 for down,up in pairs]
         for pair,(score,_) in zip(pairs,self._score_many(frame,signals)):
             if score>best_score:
                 best,best_score=pair,score
@@ -469,7 +482,8 @@ class MSTGAM:
         for generation in range(self.generations + 1):
             # Batch all votes, then reuse simulator results for identical actions.
             buy, sell, hold = population @ buy_mask, population @ sell_mask, population @ hold_mask
-            all_signals = _vote_totals(buy, sell, hold, active)
+            all_signals = apply_cadence(_vote_totals(buy, sell, hold, active, self.vote_margin), frame["timestamp"],
+                                        self.decision_cadence, axis=1)
             if excess:
                 evaluations = self._excess_scores(self._fill_paths(frame, all_signals), sampler.mask(generation))
             else:
@@ -507,7 +521,8 @@ class MSTGAM:
             # Sub-window scores differ per generation, so the deployed weights are
             # the final population's best on the FULL training window.
             buy, sell, hold = population @ buy_mask, population @ sell_mask, population @ hold_mask
-            keys = self._fill_paths(frame, _vote_totals(buy, sell, hold, active))
+            keys = self._fill_paths(frame, apply_cadence(_vote_totals(buy, sell, hold, active, self.vote_margin),
+                                                         frame["timestamp"], self.decision_cadence, axis=1))
             final = self._excess_scores(keys, None)
             best_index = int(np.argmax([value[0] for value in final]))
             best_score, best_trades = final[best_index]
@@ -557,7 +572,8 @@ class MSTGAM:
         times, times_ns = self._clock(frame)
         prices = frame["close"].to_numpy()
         features = [_profile_features(prices, times, theta) for theta in THRESHOLDS]
-        return aggregate_signals(self._opinions(features, times_ns), self.weights_, self.min_votes)
+        return apply_cadence(aggregate_signals(self._opinions(features, times_ns), self.weights_, self.min_votes,
+                                               self.vote_margin), frame["timestamp"], self.decision_cadence)
 
     def parameters(self) -> dict:
         if not self._fitted:
@@ -570,7 +586,8 @@ class MSTGAM:
             "risk_free_return": self.risk_free_return, "execution": asdict(self.execution),
             "fitness": self.fitness, "sign_adjusted": self.sign_adjusted, "mutation": self.mutation,
             "mutation_scale": self.mutation_scale, "min_trades_per_year": self.min_trades_per_year,
-            "subwindow_fraction": self.subwindow_fraction,
+            "subwindow_fraction": self.subwindow_fraction, "vote_margin": self.vote_margin,
+            "decision_cadence": self.decision_cadence,
             "weights": self.weights_.tolist(), "thresholds": list(THRESHOLDS),
             "genes": [{"strategy": strategy, "threshold_index": index} for strategy, index in GENES],
             "calibration": [asdict(item) for item in self.calibration_],

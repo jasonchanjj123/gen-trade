@@ -175,3 +175,38 @@ penalty, daily profiles equal to compounded trades, LP weights at the global
 ratio maximum, Ring variants deploying their weights, the validation metric
 and protocol header, lockbox refusal and unlock, stitched excess identities
 and year-clustered pooling.
+
+## Results 2026-11-05 extensions: turnover
+
+The audited2 runs (`claude/results-audited2-2026-11-05.md` in the gen-trader
+project) split each method's shortfall against the exposure-matched blend into
+timing (method versus random placements of the same trades) and the structure
+and cost of trading (random placements versus the blend). Timing was at chance;
+the trading component was −0.7% to −5.3% a year and highly significant. These
+changes test fewer, slower decisions directly. All defaults keep earlier
+behavior: small fits under the paper, improved and robust profiles reproduce
+the previous commit exactly.
+
+| Option | Where | Change |
+| --- | --- | --- |
+| `decision_cadence="weekly"\|"monthly"` | all three methods (`methods/cadence.py`) | Act only on the first bar of each calendar week or month (UTC open time), on the most recent nonzero signal raised since the previous decision; other bars emit no action. Applied in training, calibration and prediction; causal (uses bars up to the decision bar only). Profit targets, stops and holding deadlines still run daily |
+| `vote_margin` | MSTGAM | A buy or sell needs a weighted lead of at least this share of the vote over the other side; otherwise hold. 0 keeps the paper rule. Replaces `min_votes` as the validation knob: min_votes 3 and 2 gave identical weights in 111–115 of 126 fits |
+| Ring selection haircut | `IGTSPRing` (blend_excess) | Now over every chromosome evaluated in the final stage (exit-policy profiles computed in blocks), not only the final population; `unique_evaluations` counts all of them under stochastic fitness |
+
+Profiles (validation knobs in brackets):
+
+- `robust_weekly`: robust with weekly decisions; trade floors 3 a year; MSTGAM
+  [vote_margin 0.1, 0.25]; MOO3 [volatility multiple 1, 2]; Ring [12, 17 groups].
+- `robust_monthly`: the same with monthly decisions and trade floors of 1 a year.
+
+```bash
+gen-trade benchmark --protocol audited2 --method-profile robust_weekly --output reports/audited2-robust-weekly
+gen-trade benchmark --protocol audited2 --method-profile robust_monthly --output reports/audited2-robust-monthly
+```
+
+Known limits: the random-timing null still places trades on any bar, not only
+after decision bars, so a calendar effect of the cadence counts as timing; the
+Ring haircut covers the GA search inside the final 34-rule bank, not the bank's
+selection from the 1,764-rule pool; monthly decisions leave few validation-year
+trades, so expect more configurations to fail the two-trade validation rule.
+`lockbox.json` was re-frozen to include both profiles (lockbox untouched).
