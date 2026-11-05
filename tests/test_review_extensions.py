@@ -398,3 +398,68 @@ def test_random_timing_uses_aligned_placements_when_given_a_cadence():
     result = run_market_backtest(bars, signal, execution())
     timing, note = random_timing(result, bars, execution(), reps=30, seed=2, decision=decision)
     assert note is None and timing["construction"].endswith("decision bars")
+
+
+# --- lockbox universe and pre-registered hypotheses ------------------------------------
+
+from gen_trade.benchmark import evaluate_hypotheses, hypotheses_hash
+from gen_trade.market_data import (DEFAULT_FX, DEFAULT_STOCKS, DJIA_2015, LOCKBOX_EXCLUDED, LOCKBOX_FX,
+                                   LOCKBOX_STOCKS, UNIVERSES)
+
+
+def test_lockbox_universe_follows_its_rule_and_avoids_examined_instruments():
+    assert len(DJIA_2015) == len(set(DJIA_2015)) == 30 and "AAPL" not in DJIA_2015
+    assert set(LOCKBOX_STOCKS) == set(DJIA_2015) - set(LOCKBOX_EXCLUDED) and len(LOCKBOX_STOCKS) == 22
+    assert all("/" in pair and "USD" in pair.split("/") for pair in LOCKBOX_FX)
+    assert not set(LOCKBOX_STOCKS + LOCKBOX_FX) & set(DEFAULT_STOCKS + DEFAULT_FX)
+    assert UNIVERSES["lockbox"][0] == LOCKBOX_STOCKS and "2015-01-02" in UNIVERSES["lockbox"][2]
+
+
+def test_hypotheses_are_hashed_at_freeze_and_edits_block_the_unlock(tmp_path):
+    hypotheses = [{"id":"H1", "profile":"robust", "method":"mstgam", "kind":"pooled_excess_vs_blend", "alpha":.05}]
+    record = freeze_profiles(tmp_path / "lock.json", first_test_year=2026, symbols=["MSFT"], profiles=["robust"],
+                             hypotheses=hypotheses, universe_rule="rule")
+    assert record["hypotheses_sha256"] == hypotheses_hash(hypotheses) and record["universe_rule"] == "rule"
+    lock = json.loads((tmp_path / "lock.json").read_text())
+    common = dict(symbols=["MSFT"], last_test_year=2025, unlock=True, method_profile="robust",
+                  candidates=ROBUST_CANDIDATES)
+    assert check_lockbox(lock, **common)["hypotheses_sha256"] == record["hypotheses_sha256"]
+    lock["hypotheses"][0]["alpha"] = .1
+    with pytest.raises(ValueError, match="edited"):
+        check_lockbox(lock, **common)
+
+
+def _lock_fold(index, seed, year, excess_mean, train_ir):
+    controls = {"minus_exposure_matched_blend":{"paired_return_difference_inference":{"mean":excess_mean}}}
+    training = {"variant":{"selection_haircut":{"selected_excess_sharpe_annualized":train_ir}}}
+    return {"index":index, "base_seed":seed, "test_first_open":f"{year}-01-02",
+            "exposure_controls":{"mstgam":controls, "igtsp_ring":controls},
+            "methods":{"mstgam":{"training":training}, "igtsp_ring":{"training":training}}}
+
+
+def test_preregistered_hypotheses_are_evaluated_and_settings_are_enforced():
+    rng = np.random.default_rng(4)
+    reports = {}
+    for symbol in ("A", "B", "C", "D"):
+        folds = []
+        for i, year in enumerate(range(2019, 2026)):
+            skill = rng.normal(.0003, .0001)
+            for seed in (11, 22):
+                folds.append(_lock_fold(i, seed, year, skill, skill * 1e4 + rng.normal(0, .1)))
+        reports[symbol] = {"folds":folds, "periods_per_year_used":252.}
+    specs = [{"id":"H1", "profile":"p", "protocol":"audited2", "method":"mstgam", "kind":"pooled_excess_vs_blend",
+              "alpha":.05, "settings":{"population_size":64}},
+             {"id":"H2", "profile":"p", "protocol":"audited2", "method":"igtsp_ring",
+              "kind":"training_test_rank_correlation", "alpha":.05},
+             {"id":"H3", "profile":"other", "method":"mstgam", "kind":"pooled_excess_vs_blend", "alpha":.05}]
+    rows = evaluate_hypotheses(specs, method_profile="p", protocol="audited2", reports=reports, manifest={},
+                               settings={"population_size":64})
+    assert [r["id"] for r in rows] == ["H1", "H2"] and all(r["decision_level"] == .05 / 3 for r in rows)
+    assert rows[0]["statistic"]["cells"] == 28 and rows[0]["decision"] == "reject H0 (supported)"
+    assert set(rows[0]["leave_one_instrument_out_t"]) == set(reports)
+    assert rows[1]["statistic"]["spearman"] > .8 and rows[1]["decision"] == "reject H0 (supported)"
+    other = evaluate_hypotheses(specs, method_profile="p", protocol="audited2", reports=reports, manifest={},
+                                settings={"population_size":8})
+    assert other[0]["decision"] == "not evaluated" and "population_size" in other[0]["note"]
+    assert evaluate_hypotheses(specs, method_profile="p", protocol="audited", reports=reports,
+                               manifest={})[0]["decision"] == "not evaluated"

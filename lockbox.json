@@ -1,7 +1,36 @@
 {
-  "created": "2026-11-05T11:11:15.931451+00:00",
+  "created": "2026-11-05T13:20:13.166586+00:00",
   "first_test_year": 2026,
-  "symbols": [],
+  "symbols": [
+    "AUD/USD",
+    "AXP",
+    "BA",
+    "CAT",
+    "CSCO",
+    "CVX",
+    "DIS",
+    "GS",
+    "HD",
+    "INTC",
+    "JNJ",
+    "JPM",
+    "KO",
+    "MCD",
+    "MSFT",
+    "NKE",
+    "NZD/USD",
+    "PG",
+    "TRV",
+    "UNH",
+    "USD/CAD",
+    "USD/CHF",
+    "USD/NOK",
+    "USD/SEK",
+    "V",
+    "VZ",
+    "WMT",
+    "XOM"
+  ],
   "frozen_profiles": {
     "improved": "97858e906fc95e5b498cb799ebfe0feac9fce8d8421c92485c56cc5110d7e043",
     "paper": "98d6dec0c19047580fb1975765a91791f52a41017d373a79daf515d618ce3cdc",
@@ -9,6 +38,57 @@
     "robust_monthly": "5e1452a34c8f029f04e0b0c31eb2901bc16d236c66eaf933cec50f4c930f8cb9",
     "robust_weekly": "7a1bdba12215f154a72fb0b37a7becd6f4d3cf67481ec7d9c4a9799ec06420ff"
   },
-  "code_sha256_at_freeze": "cec665c9e04965105b127bc592d804a4103b72a8a118497936a1c7949a444ed1",
-  "note": "Forward data from 2026 is held out. Add never-examined instruments with --symbols before fetching them. Re-frozen 2026-11-05 to add robust_weekly/robust_monthly; lockbox still untouched."
+  "code_sha256_at_freeze": "38aec55e272cb5bb9f0c1fbb27b2753347dcf85078e87fb289326b6fc8122c87",
+  "note": "Held out: the rule-based lockbox universe (all test years) and every instrument from 2026. Unlock once per declared run: robust_monthly (H1) and robust (H2), protocol audited2, data/lockbox-2015-2025.",
+  "universe_rule": "DJIA constituents on 2015-01-02 without spin-offs, entity-replacing mergers or ticker changes in 2015-2025 (splits and cash dividends only), plus the remaining G10 currencies against USD; fixed before any of these instruments was fetched or examined",
+  "hypotheses": [
+    {
+      "id": "H1",
+      "statement": "MSTGAM with monthly decisions earns a positive excess over its exposure-matched cash/buy-and-hold blend",
+      "profile": "robust_monthly",
+      "protocol": "audited2",
+      "method": "mstgam",
+      "kind": "pooled_excess_vs_blend",
+      "statistic": "mean over instrument x test-year cells (seeds averaged) of annualized excess over the blend; one-sided t over the yearly cross-instrument means, df = years - 1",
+      "alpha": 0.05,
+      "correction": "Bonferroni over this family of 2",
+      "secondary": "median cell, sign count and leave-one-instrument-out t are reported, not decisive",
+      "origin": "2019-2025 research runs: +5.3%/yr, t 2.8, concentrated in GRPN and GM",
+      "settings": {
+        "population_size": 64,
+        "generations": 20,
+        "seeds": [
+          11,
+          22,
+          33
+        ],
+        "first_test_year": 2019,
+        "last_test_year": 2025
+      }
+    },
+    {
+      "id": "H2",
+      "statement": "Ring's selected training excess information ratio predicts its test-year excess over the blend",
+      "profile": "robust",
+      "protocol": "audited2",
+      "method": "igtsp_ring",
+      "kind": "training_test_rank_correlation",
+      "statistic": "Spearman correlation over instrument x test-year cells (seeds averaged) between the selected chromosome's training excess IR and its test-year annualized excess; one-sided",
+      "alpha": 0.05,
+      "correction": "Bonferroni over this family of 2",
+      "origin": "2019-2025 research run: rho 0.19 over fold-seed fits, p 0.03",
+      "settings": {
+        "population_size": 64,
+        "generations": 20,
+        "seeds": [
+          11,
+          22,
+          33
+        ],
+        "first_test_year": 2019,
+        "last_test_year": 2025
+      }
+    }
+  ],
+  "hypotheses_sha256": "fd88f75dc87388793e0c8ce677a76981b5409ce35f940f71d6d38d6d712cb567"
 }

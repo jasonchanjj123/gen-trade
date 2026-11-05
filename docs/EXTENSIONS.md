@@ -216,3 +216,45 @@ Known limits: the Ring haircut covers the GA search inside the final 34-rule ban
 selection from the 1,764-rule pool; monthly decisions leave few validation-year
 trades, so expect more configurations to fail the two-trade validation rule.
 `lockbox.json` was re-frozen to include both profiles (lockbox untouched).
+
+## Lockbox universe and pre-registered hypotheses
+
+Every profile so far was tuned and compared on the same six instruments and
+test years, so the monthly MSTGAM result (+5.3%/yr over the blend, t 2.8,
+concentrated in GRPN and GM) is a hypothesis, not a finding. `lockbox.json`
+now holds out a second universe, fixed by rule before any of its data was
+fetched (`market_data.LOCKBOX_*`):
+
+- Stocks: the 30 DJIA constituents in effect on 2015-01-02, minus eight with a
+  spin-off, an entity-replacing merger or a ticker change in 2015–2025 (MMM,
+  T, DD, GE, IBM, MRK, PFE, UTX), because the pipeline models only splits and
+  cash dividends: 22 stocks.
+- FX: the remaining G10 currencies against USD (AUD/USD, NZD/USD, USD/CAD,
+  USD/CHF, USD/NOK, USD/SEK); crosses are excluded because the engine needs
+  USD as base or quote.
+
+Two hypotheses are declared in `docs/preregistered-hypotheses.json` and
+frozen into `lockbox.json` with a hash; an unlock refuses edited hypotheses,
+a changed profile or different run settings:
+
+| ID | Run | Test | Level |
+| --- | --- | --- | --- |
+| H1 | `robust_monthly`, audited2 | MSTGAM's pooled excess over the exposure-matched blend > 0; one-sided t over yearly cross-instrument means | 0.025 (Bonferroni, 2) |
+| H2 | `robust`, audited2 | Ring's selected training excess IR is positively rank-correlated with its test-year excess over instrument-year cells | 0.025 |
+
+An unlocked run writes the decisions to `summary.json` (`preregistered_tests`)
+and to a "Pre-registered lockbox tests" section of `report.md`, with the median
+cell and leave-one-instrument-out t as non-decisive diagnostics.
+
+```bash
+gen-trade fetch-data --universe lockbox --directory data/lockbox-2015-2025
+gen-trade benchmark --data-directory data/lockbox-2015-2025 --protocol audited2 \
+  --method-profile robust_monthly --output reports/lockbox-robust-monthly --unlock-lockbox
+gen-trade benchmark --data-directory data/lockbox-2015-2025 --protocol audited2 \
+  --method-profile robust --output reports/lockbox-robust --unlock-lockbox
+```
+
+Run each once with the declared settings (population 64, 20 generations,
+seeds 11/22/33, test years 2019–2025); 28 instruments take roughly five times
+as long as the six-instrument runs. Fetching runs only the data-quality checks
+(sessions, crossed quotes); look at no returns before the two runs finish.

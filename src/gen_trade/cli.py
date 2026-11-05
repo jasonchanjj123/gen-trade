@@ -18,6 +18,8 @@ def main(argv=None) -> int:
     fetch.add_argument('--start',default='2015-01-01')
     fetch.add_argument('--end',default='2026-01-01',help='Exclusive end date')
     fetch.add_argument('--refresh',action='store_true')
+    fetch.add_argument('--universe',choices=('default','lockbox'),default='default',
+                       help='default: the six research instruments; lockbox: the rule-based held-out universe')
     benchmark=commands.add_parser('benchmark',help='Run all three methods on calendar-year stock/FX folds')
     benchmark.add_argument('--data-directory',type=Path,default=Path('data/stocks-fx-2015-2025'))
     benchmark.add_argument('--output',type=Path,default=Path('reports/stocks-fx-2015-2025'))
@@ -44,6 +46,8 @@ def main(argv=None) -> int:
     freeze.add_argument('--symbols',nargs='*',default=[],help='Instruments reserved for the lockbox')
     freeze.add_argument('--profiles',nargs='*',help='Profiles to freeze (default: all)')
     freeze.add_argument('--note',default='')
+    freeze.add_argument('--hypotheses',type=Path,help='JSON list of pre-registered hypotheses (evaluated when the lockbox is unlocked)')
+    freeze.add_argument('--universe',choices=('lockbox',),help='Use the rule-based lockbox universe for --symbols and record its rule')
     benchmark.add_argument('--random-timing-reps',type=int,default=200)
     reanalyze=commands.add_parser('reanalyze',help='Recompute a finished benchmark summary with the current statistics')
     reanalyze.add_argument('source',type=Path,help='Finished benchmark directory (left unchanged)')
@@ -88,7 +92,10 @@ def main(argv=None) -> int:
     try:
         if args.command=='fetch-data':
             from .market_data import fetch_dataset
-            manifest=fetch_dataset(args.directory,start=args.start,end=args.end,refresh=args.refresh)
+            from .market_data import UNIVERSES
+            stocks,fx_pairs,rule=UNIVERSES[args.universe]
+            manifest=fetch_dataset(args.directory,start=args.start,end=args.end,refresh=args.refresh,
+                                   stocks=stocks,fx_pairs=fx_pairs,universe_selection=rule)
             print(f"Verified {len(manifest['universe'])} instruments in {args.directory}")
             return 0
         if args.command=='reanalyze':
@@ -110,8 +117,14 @@ def main(argv=None) -> int:
             return 0
         if args.command=='freeze-profiles':
             from .benchmark import freeze_profiles
-            record=freeze_profiles(args.output,first_test_year=args.first_test_year,symbols=args.symbols,
-                                   profiles=args.profiles,note=args.note)
+            symbols,rule=list(args.symbols),None
+            if args.universe:
+                from .market_data import UNIVERSES
+                stocks,fx_pairs,rule=UNIVERSES[args.universe]
+                symbols=sorted(set(symbols)|set(stocks)|set(fx_pairs))
+            record=freeze_profiles(args.output,first_test_year=args.first_test_year,symbols=symbols,
+                                   profiles=args.profiles,note=args.note,universe_rule=rule,
+                                   hypotheses=json.loads(args.hypotheses.read_text()) if args.hypotheses else None)
             print(f"Froze {len(record['frozen_profiles'])} profile(s); lockbox from {record['first_test_year']} in {args.output}")
             return 0
         markets = synthetic_markets(args.bars,args.seed) if args.command == "demo" else read_market_data(args.data)

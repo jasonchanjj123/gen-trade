@@ -184,9 +184,11 @@ gen-trade benchmark --protocol audited2 --method-profile robust_weekly --output 
 gen-trade reanalyze reports/audited-improved --output reports/audited-improved-reanalysis --data-directory data/stocks-fx-2015-2025
 ```
 
-`lockbox.json` holds out test years from 2026 (and any listed instruments); the
+`lockbox.json` holds out test years from 2026 and a rule-based second universe (22
+DJIA-2015 stocks, 6 USD pairs; `gen-trade fetch-data --universe lockbox`); the
 benchmark refuses them unless `--unlock-lockbox` runs a profile that still matches
-its frozen hash (`gen-trade freeze-profiles`).
+its frozen hash. Unlocked runs evaluate the hypotheses pre-registered in
+`docs/preregistered-hypotheses.json` (docs/EXTENSIONS.md, last section).
 
 ## Statistical scope
 

@@ -24,6 +24,29 @@ from .data import validate_bars
 DEFAULT_STOCKS = ('AAPL','GM','GRPN')
 DEFAULT_FX = ('EUR/USD','GBP/USD','USD/JPY')
 
+# EXTENSION (2026-11-05): lockbox universe, fixed by rule before any of these
+# instruments was fetched or examined. Stocks: the 30 Dow Jones Industrial
+# Average constituents in effect on 2015-01-02 (the set of 2013-09-20 to
+# 2015-03-19), minus those with a pro-rata spin-off, a merger that replaced the
+# listed entity, or a ticker change in 2015-2025, because this pipeline models
+# only splits and cash dividends. FX: the remaining G10 currencies against the
+# USD (no crosses: the engine needs USD as base or quote).
+LOCKBOX_EXCLUDED = {
+    'MMM':'Solventum spin-off (2024)', 'T':'WarnerMedia spin-off (2022)',
+    'DD':'Dow merger (2017) and Dow/Corteva separations (2019)',
+    'GE':'GE HealthCare (2023) and GE Vernova (2024) spin-offs', 'IBM':'Kyndryl spin-off (2021)',
+    'MRK':'Organon spin-off (2021)', 'PFE':'Upjohn/Viatris spin-off (2020)',
+    'UTX':'Carrier/Otis spin-offs and Raytheon merger, ticker now RTX (2020)'}
+DJIA_2015 = ('MMM','AXP','T','BA','CAT','CVX','CSCO','KO','DD','XOM','GE','GS','HD','INTC','IBM','JNJ','JPM','MCD',
+             'MRK','MSFT','NKE','PFE','PG','TRV','UNH','UTX','VZ','V','WMT','DIS')
+LOCKBOX_STOCKS = tuple(s for s in DJIA_2015 if s not in LOCKBOX_EXCLUDED)
+LOCKBOX_FX = ('AUD/USD','NZD/USD','USD/CAD','USD/CHF','USD/NOK','USD/SEK')
+LOCKBOX_RULE = ('DJIA constituents on 2015-01-02 without spin-offs, entity-replacing mergers or ticker changes in '
+                '2015-2025 (splits and cash dividends only), plus the remaining G10 currencies against USD; '
+                'fixed before any of these instruments was fetched or examined')
+UNIVERSES = {'default':(DEFAULT_STOCKS, DEFAULT_FX, 'user-selected fixed instruments; no survivorship-free universe claim'),
+             'lockbox':(LOCKBOX_STOCKS, LOCKBOX_FX, LOCKBOX_RULE)}
+
 
 def _download(url: str, path: Path, refresh=False) -> tuple[bytes, dict]:
     info_path = path.with_suffix(path.suffix+'.meta.json')
@@ -166,7 +189,8 @@ def normalize_duka_fx(bid: pd.DataFrame, ask: pd.DataFrame, symbol: str, start: 
 
 
 def fetch_dataset(directory: str | Path, *, start='2015-01-01', end='2026-01-01',
-                  stocks=DEFAULT_STOCKS, fx_pairs=DEFAULT_FX, refresh=False) -> dict:
+                  stocks=DEFAULT_STOCKS, fx_pairs=DEFAULT_FX, refresh=False,
+                  universe_selection='user-selected fixed instruments; no survivorship-free universe claim') -> dict:
     directory = Path(directory)
     directory.mkdir(parents=True,exist_ok=True)
     if not refresh and (directory/'manifest.json').exists():
@@ -230,7 +254,7 @@ def fetch_dataset(directory: str | Path, *, start='2015-01-01', end='2026-01-01'
             'start':frame['timestamp'].iloc[0].isoformat(),'end':frame['available_at'].iloc[-1].isoformat(),
             'periods_per_year':len(frame)/(elapsed/365.2425)})
     manifest = {'schema_version':1,'data_kind':'real historical market data','requested_start':start,'requested_end_exclusive':end,
-                'universe':list(normalized),'universe_selection':'user-selected fixed instruments; no survivorship-free universe claim',
+                'universe':list(normalized),'universe_selection':universe_selection,
                 'instruments':instruments}
     (directory/'manifest.json').write_text(json.dumps(manifest,indent=2,allow_nan=False)+'\n')
     return manifest

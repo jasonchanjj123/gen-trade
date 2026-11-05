@@ -1,0 +1,29 @@
+[
+  {
+    "id": "H1",
+    "statement": "MSTGAM with monthly decisions earns a positive excess over its exposure-matched cash/buy-and-hold blend",
+    "profile": "robust_monthly",
+    "protocol": "audited2",
+    "method": "mstgam",
+    "kind": "pooled_excess_vs_blend",
+    "statistic": "mean over instrument x test-year cells (seeds averaged) of annualized excess over the blend; one-sided t over the yearly cross-instrument means, df = years - 1",
+    "alpha": 0.05,
+    "correction": "Bonferroni over this family of 2",
+    "secondary": "median cell, sign count and leave-one-instrument-out t are reported, not decisive",
+    "origin": "2019-2025 research runs: +5.3%/yr, t 2.8, concentrated in GRPN and GM",
+    "settings": {"population_size": 64, "generations": 20, "seeds": [11, 22, 33], "first_test_year": 2019, "last_test_year": 2025}
+  },
+  {
+    "id": "H2",
+    "statement": "Ring's selected training excess information ratio predicts its test-year excess over the blend",
+    "profile": "robust",
+    "protocol": "audited2",
+    "method": "igtsp_ring",
+    "kind": "training_test_rank_correlation",
+    "statistic": "Spearman correlation over instrument x test-year cells (seeds averaged) between the selected chromosome's training excess IR and its test-year annualized excess; one-sided",
+    "alpha": 0.05,
+    "correction": "Bonferroni over this family of 2",
+    "origin": "2019-2025 research run: rho 0.19 over fold-seed fits, p 0.03",
+    "settings": {"population_size": 64, "generations": 20, "seeds": [11, 22, 33], "first_test_year": 2019, "last_test_year": 2025}
+  }
+]

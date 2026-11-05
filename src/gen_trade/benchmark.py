@@ -39,12 +39,19 @@ def profile_hash(candidates):
     return hashlib.sha256(json.dumps(candidates,sort_keys=True).encode()).hexdigest()
 
 
-def freeze_profiles(path,*,first_test_year,symbols=(),profiles=None,note=''):
+def hypotheses_hash(hypotheses):
+    return hashlib.sha256(json.dumps(hypotheses,sort_keys=True).encode()).hexdigest()
+
+
+def freeze_profiles(path,*,first_test_year,symbols=(),profiles=None,note='',hypotheses=None,universe_rule=None):
     """EXTENSION: declare a lockbox and freeze the named profiles before using it.
 
     Benchmarks refuse lockbox instruments or test years from ``first_test_year``
     on unless explicitly unlocked, and an unlock only runs a profile whose
-    candidate configurations still hash to the frozen value.
+    candidate configurations still hash to the frozen value. Pre-registered
+    ``hypotheses`` (and the rule that chose the lockbox ``symbols``) are stored
+    with a hash; an unlock refuses hypotheses edited after freezing. The git
+    commit of this file is the authoritative record.
     """
     names=list(profiles) if profiles else sorted(CANDIDATE_PROFILES)
     if set(names)-set(CANDIDATE_PROFILES):
@@ -52,6 +59,11 @@ def freeze_profiles(path,*,first_test_year,symbols=(),profiles=None,note=''):
     record={'created':pd.Timestamp.now(tz='UTC').isoformat(),'first_test_year':int(first_test_year),
             'symbols':sorted(symbols),'frozen_profiles':{name:profile_hash(CANDIDATE_PROFILES[name]) for name in names},
             'code_sha256_at_freeze':_code_hash(),'note':note or 'Untouched held-out data; unlock once, after freezing.'}
+    if universe_rule:
+        record['universe_rule']=universe_rule
+    if hypotheses:
+        record['hypotheses']=list(hypotheses)
+        record['hypotheses_sha256']=hypotheses_hash(record['hypotheses'])
     Path(path).write_text(json.dumps(record,indent=2)+'\n')
     return record
 
@@ -70,7 +82,9 @@ def check_lockbox(lockbox,*,symbols,last_test_year,method_profile,candidates,unl
     frozen=lockbox.get('frozen_profiles',{}).get(method_profile)
     if frozen is None or frozen!=profile_hash(candidates):
         raise ValueError(f'Lockbox: profile {method_profile!r} is not frozen or changed since freezing')
-    return {'lockbox_touched':True,'unlocked_symbols':touched,'unlocked_from_year':int(lockbox['first_test_year']),
+    if lockbox.get('hypotheses') and hypotheses_hash(lockbox['hypotheses'])!=lockbox.get('hypotheses_sha256'):
+        raise ValueError('Lockbox: pre-registered hypotheses were edited after freezing')
+    return {'lockbox_touched':True,'hypotheses_sha256':lockbox.get('hypotheses_sha256'),'unlocked_symbols':touched,'unlocked_from_year':int(lockbox['first_test_year']),
             'profile_hash':frozen,'lockbox_created':lockbox.get('created'),
             'code_changed_since_freeze':lockbox.get('code_sha256_at_freeze')!=_code_hash()}
 
@@ -394,6 +408,81 @@ def pooled_controls(reports,manifest):
     return rows
 
 
+def _cells(reports,manifest,method,value):
+    cells={}
+    for symbol,report in reports.items():
+        annual=_periods_per_year(report,manifest,symbol)
+        for fold in report['folds']:
+            item=value(fold,method,annual)
+            if item is not None:
+                cells.setdefault((symbol,fold['test_first_open'][:4]),[]).append(item)
+    return {key:tuple(np.mean(v,axis=0)) if isinstance(v[0],tuple) else float(np.mean(v)) for key,v in cells.items()}
+
+
+def evaluate_hypotheses(hypotheses,*,method_profile,protocol,reports,manifest,settings=None):
+    """EXTENSION: evaluate the pre-registered lockbox hypotheses for this run.
+
+    Kinds: ``pooled_excess_vs_blend`` (mean over instrument x test-year cells,
+    seeds averaged, of annualized excess over the exposure-matched blend;
+    one-sided t over the yearly cross-instrument means, df = years - 1) and
+    ``training_test_rank_correlation`` (Spearman over cells between the
+    selected candidate's training excess IR and its test-year excess,
+    one-sided). Each is decided at alpha / family size (Bonferroni), so every
+    run can be decided on its own.
+    """
+    from scipy.stats import spearmanr, t as student
+    family=len(hypotheses)
+    results=[]
+    def excess(fold,method,annual):
+        controls=fold.get('exposure_controls',{}).get(method)
+        mean=None if controls is None else controls['minus_exposure_matched_blend']['paired_return_difference_inference']['mean']
+        return None if mean is None else mean*annual
+    def pair(fold,method,annual):
+        test=excess(fold,method,annual)
+        haircut=((fold['methods'][method].get('training') or {}).get('variant') or {}).get('selection_haircut') or {}
+        train=haircut.get('selected_excess_sharpe_annualized')
+        return None if test is None or train is None else (float(train),float(test))
+    for spec in hypotheses:
+        if spec.get('profile')!=method_profile:
+            continue
+        row={'id':spec['id'],'method':spec['method'],'kind':spec['kind'],'statement':spec.get('statement'),
+             'alpha':spec['alpha'],'decision_level':spec['alpha']/family,'family_size':family}
+        if spec.get('protocol') and spec['protocol']!=protocol:
+            results.append({**row,'decision':'not evaluated','note':f"declared for protocol {spec['protocol']}"})
+            continue
+        declared=spec.get('settings') or {}
+        differs=sorted(k for k,v in declared.items() if settings is not None and settings.get(k)!=v)
+        if differs:
+            results.append({**row,'decision':'not evaluated','note':f'run settings differ from the declaration: {differs}'})
+            continue
+        if spec['kind']=='pooled_excess_vs_blend':
+            cells=_cells(reports,manifest,spec['method'],excess)
+            pooled=_pooled(cells,0.)
+            p=None if pooled.get('t_year_clustered') is None else float(1-student.cdf(pooled['t_year_clustered'],pooled['years']-1))
+            leave_one=[]
+            for symbol in reports:
+                rest={k:v for k,v in cells.items() if k[0]!=symbol}
+                leave_one.append((symbol,_pooled(rest,0.).get('t_year_clustered')))
+            row.update(statistic=pooled,p_value_one_sided=p,median_cell=float(np.median(list(cells.values()))) if cells else None,
+                       leave_one_instrument_out_t=dict(leave_one))
+        elif spec['kind']=='training_test_rank_correlation':
+            cells=_cells(reports,manifest,spec['method'],pair)
+            values=np.array(list(cells.values()))
+            if len(values)>=8:
+                test=spearmanr(values[:,0],values[:,1],alternative='greater')
+                p=float(test.pvalue);row.update(statistic={'cells':int(len(values)),'spearman':float(test.statistic)})
+            else:
+                p=None;row.update(statistic={'cells':int(len(values))})
+            row['p_value_one_sided']=p
+        else:
+            results.append({**row,'decision':'not evaluated','note':'unknown hypothesis kind'})
+            continue
+        row['decision']=('undefined' if row['p_value_one_sided'] is None else
+                         'reject H0 (supported)' if row['p_value_one_sided']<row['decision_level'] else 'not supported')
+        results.append(row)
+    return results
+
+
 def _render_report(directory,summary,paths):
     directory=Path(directory)
     def percent(value):return 'undefined' if value is None else f'{value*100:.2f}%'
@@ -436,6 +525,17 @@ def _render_report(directory,summary,paths):
                     '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |']
             for row in summary['exposure_controls']:
                 lines.append(f"| {row['symbol']} | {row['method']} | {number(row['median_exposure'])} | {number(row['median_beta'])} | {percent(row['median_alpha_annualized'])} | {percent(row['share_beating_exposure_matched_blend'])} | {number(row['median_random_timing_percentile'])} | {row['test_years_without_trades']} / {row['fold_seed_runs']} |")
+    if summary.get('preregistered_tests'):
+        lines+=['','## Pre-registered lockbox tests','',
+                'Declared in lockbox.json before the lockbox data were fetched; decided at alpha / family size (Bonferroni).',
+                '','| ID | Method | Statement | Statistic | One-sided p | Level | Decision |','| --- | --- | --- | --- | ---: | ---: | --- |']
+        for row in summary['preregistered_tests']:
+            stat=row.get('statistic') or {}
+            text=(f"mean {stat['mean']*100:+.2f}%, t {stat['t_year_clustered']:+.2f} ({stat['cells']} cells)"
+                  if 'mean' in stat and stat.get('mean') is not None and stat.get('t_year_clustered') is not None else
+                  f"rho {stat['spearman']:+.3f} ({stat['cells']} cells)" if 'spearman' in stat else row.get('note','–'))
+            p=row.get('p_value_one_sided')
+            lines.append(f"| {row['id']} | {row['method']} | {row.get('statement') or ''} | {text} | {'–' if p is None else f'{p:.4f}'} | {row['decision_level']:.3f} | {row['decision']} |")
     if summary.get('pooled_controls'):
         def tval(value):return '–' if value is None else f'{value:+.2f}'
         lines+=['','## Pooled timing evidence (all instruments)','',
@@ -490,7 +590,9 @@ def _render_report(directory,summary,paths):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    fig,axes=plt.subplots(3,2,figsize=(15,11),sharex=True,layout='constrained')
+    columns=2 if len(summary['universe'])<=6 else 4
+    rows=max(1,int(np.ceil(len(summary['universe'])/columns)))
+    fig,axes=plt.subplots(rows,columns,figsize=(7.5*columns,3.7*rows),sharex=True,layout='constrained',squeeze=False)
     colors={'moo3':'#2563eb','mstgam':'#059669','igtsp_ring':'#ea580c','buy_and_hold':'#6b7280'}
     for ax,symbol in zip(axes.flat,summary['universe']):
         for name in (*METHOD_NAMES,'buy_and_hold'):
@@ -501,6 +603,8 @@ def _render_report(directory,summary,paths):
             if name!='buy_and_hold':ax.fill_between(dates,values.min(axis=0),values.max(axis=0),color=colors[name],alpha=.1)
         ax.axhline(1,color='#aaa',lw=.7);ax.set_title(symbol,loc='left',fontweight='bold')
         ax.set_ylabel('Net wealth / initial wealth');ax.grid(alpha=.15)
+    for ax in axes.flat[len(summary['universe']):]:
+        ax.set_visible(False)
     axes[0,0].legend(fontsize=8,ncol=2)
     fig.suptitle('2019–2025 held-out equity • median and range across declared seeds',fontsize=15)
     fig.savefig(directory/'equity.png',dpi=170)
@@ -529,7 +633,8 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
         raise ValueError('Benchmark symbols must be a unique nonempty subset of the downloaded universe')
     if lockbox is None and (Path(__file__).resolve().parents[2]/LOCKBOX_FILE).exists():
         lockbox=Path(__file__).resolve().parents[2]/LOCKBOX_FILE
-    lock=check_lockbox(json.loads(Path(lockbox).read_text()) if lockbox else None,symbols=symbols,
+    lockbox_record=json.loads(Path(lockbox).read_text()) if lockbox else None
+    lock=check_lockbox(lockbox_record,symbols=symbols,
                        last_test_year=last_test_year,method_profile=method_profile,candidates=candidates,
                        unlock=unlock_lockbox)
     settings={'population_size':population_size,'generations':generations,'seeds':list(seeds),'workers':workers,
@@ -598,6 +703,10 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
              'exposure_controls':exposure_summary(reports),
              'pooled_controls':pooled_controls(reports,manifest),
              'dataset_manifest':manifest}
+    if lock and lock.get('lockbox_touched') and lockbox_record.get('hypotheses'):
+        summary['preregistered_tests']=evaluate_hypotheses(lockbox_record['hypotheses'],method_profile=method_profile,
+                                                           protocol=protocol,reports=reports,manifest=manifest,
+                                                           settings=settings)
     (directory/'summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
     _render_report(directory,summary,paths)
     print(f'Completed benchmark: {summary["method_runs"]} method runs; report {directory/"report.md"}',flush=True)
