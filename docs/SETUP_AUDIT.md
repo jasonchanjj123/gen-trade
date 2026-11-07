@@ -164,7 +164,10 @@ Ordered by what most reduces the risk of a wrong decision.
    model calibrated on participation.
 7. Historical swap/carry for FX and borrow costs for any future short side.
 8. Versioned datasets (object storage or DVC) with schema checks at ingestion
-   (pandera is already in the research extra).
+   (pandera is already in the research extra). *Partly done 2026-11-07:*
+   ingestion contracts, anomaly screens, ECB reconciliation, rebuild-from-raw
+   lineage and a benchmark quality gate ([DATA_QUALITY.md](DATA_QUALITY.md));
+   versioned raw storage remains.
 
 **Later: governance and production readiness**
 

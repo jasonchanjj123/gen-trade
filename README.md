@@ -96,6 +96,21 @@ gen-trade benchmark --population 64 --generations 20 --seeds 11 22 33 \
 python scripts/verify-benchmark.py reports/stocks-fx-2015-2025
 ```
 
+### Data quality
+
+`fetch-data` audits every dataset it builds, and `gen-trade audit-data` re-audits
+one. The audit covers data contracts, session completeness, anomaly screens,
+reconciliation (FX against ECB reference rates; Yahoo dividends against its own
+adjusted closes; an optional licensed reference file) and lineage (every file is
+rebuilt from its raw cache with the current code). It writes `quality.json`.
+Benchmarks refuse a dataset with failed error checks and archive the audit they
+used. Warnings are reviewed and recorded in `data-quality-exceptions.json`. See
+[data sources and quality](docs/DATA_QUALITY.md), including the 2026-11-07 audit.
+
+```bash
+gen-trade audit-data data/stocks-fx-2015-2025 --ecb
+```
+
 ### Following a long run
 
 `benchmark`, `demo` and `compare` show live progress: a redrawn line on a terminal

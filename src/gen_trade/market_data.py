@@ -12,8 +12,11 @@ import hashlib
 import json
 import lzma
 from pathlib import Path
+import random
 import struct
-from urllib.parse import urlencode
+import time
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -48,19 +51,45 @@ UNIVERSES = {'default':(DEFAULT_STOCKS, DEFAULT_FX, 'user-selected fixed instrum
              'lockbox':(LOCKBOX_STOCKS, LOCKBOX_FX, LOCKBOX_RULE)}
 
 
-def _download(url: str, path: Path, refresh=False) -> tuple[bytes, dict]:
+# HTTP statuses worth retrying (throttling and transient server errors); any
+# other HTTP error, such as 404 for a missing yearly file, fails at once.
+RETRYABLE_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+DOWNLOAD_ATTEMPTS = 4
+DOWNLOAD_BACKOFF_SECONDS = 1.0
+
+
+def _utcnow() -> pd.Timestamp:
+    return pd.Timestamp.now(tz='UTC')
+
+
+def _download(url: str, path: Path, refresh=False, *, same_request=None,
+              attempts=None, backoff=None) -> tuple[bytes, dict]:
+    """Fetch ``url`` into ``path`` once; afterwards serve the hash-checked cache.
+
+    ``same_request(cached_url)`` may accept a cached response to an equivalent
+    request (Yahoo URLs embed the retrieval day, so an interrupted download
+    resumed on a later day asks for a different URL). Retries back off
+    exponentially with jitter and honour a numeric Retry-After header.
+    """
+    attempts = DOWNLOAD_ATTEMPTS if attempts is None else attempts
+    backoff = DOWNLOAD_BACKOFF_SECONDS if backoff is None else backoff
     info_path = path.with_suffix(path.suffix+'.meta.json')
     if not refresh and path.exists() and info_path.exists():
         payload, info = path.read_bytes(), json.loads(info_path.read_text())
-        if hashlib.sha256(payload).hexdigest() != info['sha256'] or info['url'] != url:
+        if hashlib.sha256(payload).hexdigest() != info['sha256']:
             raise ValueError(f'Raw cache integrity mismatch: {path}')
+        if info['url'] != url and not (same_request is not None and same_request(info['url'])):
+            raise ValueError(f'Raw cache holds a different request: {path} ({info["url"]}); '
+                             'use --refresh or a new directory')
         return payload, info
     error = None
-    for _ in range(2):
+    for attempt in range(attempts):
         try:
             request = Request(url,headers={'User-Agent':'Mozilla/5.0 (compatible; gen-trade-research)'})
             with urlopen(request,timeout=25) as response:
                 payload = response.read()
+            if not payload:
+                raise ValueError('empty response body')
             info = {'url':url,'retrieved_at':datetime.now(timezone.utc).isoformat(),
                     'sha256':hashlib.sha256(payload).hexdigest(),'bytes':len(payload)}
             path.parent.mkdir(parents=True,exist_ok=True)
@@ -69,9 +98,75 @@ def _download(url: str, path: Path, refresh=False) -> tuple[bytes, dict]:
             temporary.replace(path)
             info_path.write_text(json.dumps(info,indent=2)+'\n')
             return payload, info
-        except (OSError, ValueError) as exc:
+        except HTTPError as exc:
             error = exc
+            if exc.code not in RETRYABLE_HTTP:
+                break
+            retry_after = exc.headers.get('Retry-After') if exc.headers else None
+            wait = float(retry_after) if retry_after and retry_after.isdigit() else 0.
+        except (OSError, ValueError) as exc:
+            error, wait = exc, 0.
+        if attempt+1 < attempts:
+            time.sleep(min(60., max(wait, backoff*2**attempt*(1+.25*random.random()))))
     raise RuntimeError(f'Historical data request failed for {url}: {error}') from error
+
+
+def _yahoo_request_covers(url: str, end_seconds: int):
+    """Accept a cached Yahoo chart response to the same query whose period2 reaches ``end_seconds``."""
+    wanted = urlsplit(url)
+    wanted_query = parse_qs(wanted.query)
+    wanted_query.pop('period2', None)
+    def accept(cached_url: str) -> bool:
+        cached = urlsplit(cached_url)
+        query = parse_qs(cached.query)
+        period2 = query.pop('period2', [''])[0]
+        return ((cached.scheme, cached.netloc, cached.path) == (wanted.scheme, wanted.netloc, wanted.path)
+                and query == wanted_query and period2.isdigit() and int(period2) >= end_seconds)
+    return accept
+
+
+def fx_years(start: str, end: str) -> range:
+    """Calendar years of Dukascopy yearly files needed for ``[start, end)``."""
+    return range(pd.Timestamp(start).year, pd.Timestamp(end).year+(pd.Timestamp(end).day_of_year != 1))
+
+
+def stock_raw_path(directory: str | Path, symbol: str) -> Path:
+    return Path(directory)/'raw'/f'{symbol}-chart.json'
+
+
+def fx_raw_path(directory: str | Path, pair: str, year: int, side: str) -> Path:
+    return Path(directory)/'raw'/pair.replace('/','')/f'{year}-{side}.bi5'
+
+
+def fx_divisor(pair: str) -> int:
+    return 1000 if pair.endswith('/JPY') else 100000
+
+
+def yahoo_chart_result(payload: bytes, symbol: str) -> dict:
+    document = json.loads(payload)
+    results = document.get('chart',{}).get('result')
+    if not results:
+        error = document.get('chart',{}).get('error')
+        raise ValueError(f'{symbol}: Yahoo returned no historical chart'+(f' ({error})' if error else ''))
+    return results[0]
+
+
+def normalize_fx_payloads(payloads: dict, pair: str, start: str, end: str) -> tuple[pd.DataFrame, dict]:
+    """Decode yearly ``payloads[(year, side)]`` BID/ASK files and normalize one pair."""
+    sides = {}
+    for side in ('BID','ASK'):
+        chunks = [decode_duka_daily(payloads[(year,side)],year,fx_divisor(pair)) for year in fx_years(start,end)]
+        sides[side] = pd.concat(chunks,ignore_index=True)
+    return normalize_duka_fx(sides['BID'],sides['ASK'],pair,start,end)
+
+
+def normalizer_sha256() -> str:
+    """Hash of the code that turns raw responses into dataset files."""
+    digest = hashlib.sha256()
+    for name in ('market_data.py','data.py'):
+        digest.update(name.encode())
+        digest.update((Path(__file__).parent/name).read_bytes())
+    return digest.hexdigest()
 
 
 def normalize_yahoo_stock(result: dict, symbol: str, start: str, end: str) -> tuple[pd.DataFrame, dict]:
@@ -106,6 +201,16 @@ def normalize_yahoo_stock(result: dict, symbol: str, start: str, end: str) -> tu
         raise ValueError(f'{symbol}: session coverage mismatch: missing={list(missing.strftime("%Y-%m-%d"))}, unexpected={list(unexpected.strftime("%Y-%m-%d"))}')
     if requested.isna().any().any():
         raise ValueError(f'{symbol}: source has missing OHLCV; no prices are interpolated')
+    # The account, cost model and XNYS calendar assume a USD daily equity listing
+    # in New York; refuse a response describing anything else.
+    meta = result.get('meta') or {}
+    if meta.get('currency') != 'USD':
+        raise ValueError(f"{symbol}: provider currency {meta.get('currency')!r} is not the USD account currency")
+    expected = {'symbol':symbol, 'instrumentType':'EQUITY', 'exchangeTimezoneName':'America/New_York',
+                'dataGranularity':'1d'}
+    for key, value in expected.items():
+        if meta.get(key) not in (None, value):
+            raise ValueError(f'{symbol}: provider {key} {meta.get(key)!r} differs from expected {value!r}')
     future_factor = np.array([np.prod([r for day,r in splits.items() if day > date]) for date in requested.index])
     effective = np.array([splits.get(date,1.) for date in requested.index])
     past_factor = np.cumprod(effective)
@@ -202,22 +307,23 @@ def fetch_dataset(directory: str | Path, *, start='2015-01-01', end='2026-01-01'
         return manifest
     tasks = {}
     # Include later split events solely to undo the provider's retrospective split adjustment.
-    retrieval_end = max(pd.Timestamp(end,tz='UTC'),pd.Timestamp.now(tz='UTC').ceil('D'))
+    retrieval_end = max(pd.Timestamp(end,tz='UTC'),_utcnow().ceil('D'))
     t1, t2 = int(pd.Timestamp(start,tz='UTC').timestamp()), int(retrieval_end.timestamp())
+    end_seconds = int(pd.Timestamp(end,tz='UTC').timestamp())
     for symbol in stocks:
         query = urlencode({'period1':t1,'period2':t2,'interval':'1d','events':'div,splits','includeAdjustedClose':'true'})
-        tasks[('stock',symbol)] = ('https://query1.finance.yahoo.com/v8/finance/chart/'+symbol+'?'+query,
-                                    directory/'raw'/f'{symbol}-chart.json')
-    years = range(pd.Timestamp(start).year,pd.Timestamp(end).year+(pd.Timestamp(end).dayofyear != 1))
+        url = 'https://query1.finance.yahoo.com/v8/finance/chart/'+symbol+'?'+query
+        tasks[('stock',symbol)] = (url, stock_raw_path(directory,symbol), _yahoo_request_covers(url,end_seconds))
+    years = fx_years(start,end)
     for pair in fx_pairs:
         instrument = pair.replace('/','')
         for year in years:
             for side in ('BID','ASK'):
                 tasks[('fx',pair,year,side)] = (f'https://datafeed.dukascopy.com/datafeed/{instrument}/{year}/{side}_candles_day_1.bi5',
-                                              directory/'raw'/instrument/f'{year}-{side}.bi5')
+                                              fx_raw_path(directory,pair,year,side), None)
     responses = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_download,url,path,refresh):key for key,(url,path) in tasks.items()}
+        futures = {pool.submit(_download,url,path,refresh,same_request=same):key for key,(url,path,same) in tasks.items()}
         for future in as_completed(futures):
             key = futures[future]
             responses[key] = future.result()
@@ -225,25 +331,13 @@ def fetch_dataset(directory: str | Path, *, start='2015-01-01', end='2026-01-01'
     normalized, instruments = {}, {}
     for symbol in stocks:
         payload, source = responses[('stock',symbol)]
-        document = json.loads(payload)
-        results = document.get('chart',{}).get('result')
-        if not results:
-            raise ValueError(f'{symbol}: Yahoo returned no historical chart')
-        frame, metadata = normalize_yahoo_stock(results[0],symbol,start,end)
+        frame, metadata = normalize_yahoo_stock(yahoo_chart_result(payload,symbol),symbol,start,end)
         metadata['raw_sources'] = [source]
         normalized[symbol], instruments[symbol] = frame, metadata
     for pair in fx_pairs:
-        sides, sources = {}, []
-        divisor = 1000 if pair.endswith('/JPY') else 100000
-        for side in ('BID','ASK'):
-            chunks = []
-            for year in years:
-                payload, info = responses[('fx',pair,year,side)]
-                chunks.append(decode_duka_daily(payload,year,divisor))
-                sources.append(info)
-            sides[side] = pd.concat(chunks,ignore_index=True)
-        frame, metadata = normalize_duka_fx(sides['BID'],sides['ASK'],pair,start,end)
-        metadata['raw_sources'] = sources
+        payloads = {(year,side):responses[('fx',pair,year,side)][0] for side in ('BID','ASK') for year in years}
+        frame, metadata = normalize_fx_payloads(payloads,pair,start,end)
+        metadata['raw_sources'] = [responses[('fx',pair,year,side)][1] for side in ('BID','ASK') for year in years]
         normalized[pair], instruments[pair] = frame, metadata
     for symbol, frame in normalized.items():
         path = directory/(symbol.replace('/','_')+'.parquet')
@@ -255,17 +349,42 @@ def fetch_dataset(directory: str | Path, *, start='2015-01-01', end='2026-01-01'
             'periods_per_year':len(frame)/(elapsed/365.2425)})
     manifest = {'schema_version':1,'data_kind':'real historical market data','requested_start':start,'requested_end_exclusive':end,
                 'universe':list(normalized),'universe_selection':universe_selection,
-                'instruments':instruments}
+                'instruments':instruments,
+                'lineage':{'normalizer_sha256':normalizer_sha256(),'retrieval_end_exclusive':retrieval_end.isoformat()}}
     (directory/'manifest.json').write_text(json.dumps(manifest,indent=2,allow_nan=False)+'\n')
+    return manifest
+
+
+MANIFEST_SCHEMA_VERSIONS = (1,)
+
+
+def validate_manifest(manifest) -> dict:
+    """Check the manifest structure that loading relies on, with clear errors."""
+    if not isinstance(manifest, dict):
+        raise ValueError('Dataset manifest must be a JSON object')
+    if manifest.get('schema_version', 1) not in MANIFEST_SCHEMA_VERSIONS:
+        raise ValueError(f"Unsupported dataset manifest schema_version {manifest.get('schema_version')!r}")
+    instruments = manifest.get('instruments')
+    if not isinstance(instruments, dict) or not instruments:
+        raise ValueError('Dataset manifest needs a nonempty instruments mapping')
+    for symbol, info in instruments.items():
+        if not isinstance(info, dict) or not isinstance(info.get('file'), str) or not isinstance(info.get('sha256'), str):
+            raise ValueError(f'{symbol}: manifest entry needs a file name and its sha256')
+        if not info['file'] or Path(info['file']).name != info['file'] or info['file'] in ('.','..'):
+            raise ValueError(f'{symbol}: manifest file must be a plain file name inside the dataset directory')
     return manifest
 
 
 def load_dataset(directory: str | Path) -> tuple[dict[str,pd.DataFrame], dict]:
     directory = Path(directory)
-    manifest = json.loads((directory/'manifest.json').read_text())
+    if not (directory/'manifest.json').exists():
+        raise ValueError(f'No dataset manifest in {directory}; run gen-trade fetch-data first')
+    manifest = validate_manifest(json.loads((directory/'manifest.json').read_text()))
     markets = {}
     for symbol, info in manifest['instruments'].items():
         path = directory/info['file']
+        if not path.is_file():
+            raise ValueError(f'{symbol}: dataset file {path} is missing')
         if hashlib.sha256(path.read_bytes()).hexdigest() != info['sha256']:
             raise ValueError(f'Dataset integrity mismatch: {symbol}')
         markets[symbol] = validate_bars(pd.read_parquet(path))

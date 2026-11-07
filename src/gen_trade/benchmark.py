@@ -12,6 +12,7 @@ import pandas as pd
 
 from .backtest import BacktestResult,ExecutionConfig
 from .data import ChromosomeContext
+from .data_quality import QUALITY_FILE,benchmark_quality
 from .experiments import METHOD_NAMES,CANDIDATE_PROFILES
 from .instruments import benchmark_spec
 from .market_data import load_dataset, merge_fx_weekend_stubs
@@ -534,6 +535,20 @@ def _render_report(directory,summary,paths):
             lines+=[f"| {row['symbol']} | {row['test_year']} | {'yes' if row['traded'] else 'no'} | {'; '.join(row['reasons'])} |" for row in failed]
         else:
             lines.append(f"All {len(screen['instrument_years'])} instrument-years pass.")
+    quality=summary.get('data_quality')
+    if quality:
+        lines+=['','## Data quality','']
+        if not quality.get('report_sha256'):
+            lines.append('Not audited: the dataset had no `quality.json` (`gen-trade audit-data`; docs/DATA_QUALITY.md).')
+        else:
+            sources=', '.join(quality.get('reference_sources') or []) or 'none'
+            lines.append(f"Audit status **{quality['status']}** (`data-quality.json`, sha256 `{quality['report_sha256'][:16]}…`, "
+                         f"generated {quality.get('generated_at')}); rebuilt from raw: {'yes' if quality.get('rebuild_from_raw') else 'no'}; "
+                         f"reference sources: {sources}.")
+            if quality.get('failures_allowed'):
+                lines.append('**Run allowed despite failed error checks:** '+'; '.join(quality['failed_error_checks'])+'.')
+            for symbol,flags in (quality.get('unreviewed_warnings') or {}).items():
+                lines.append(f"- {symbol}: unreviewed warnings {', '.join(flags)}")
     settings=summary['settings']
     extended=settings.get('protocol','original')!='original' or settings.get('method_profile','paper')!='paper'
     if extended:
@@ -640,8 +655,14 @@ def _render_report(directory,summary,paths):
 def run_benchmark(data_directory,output_directory,*,population_size=64,generations=20,seeds=(11,22,33),workers=3,
                   first_test_year=2019,last_test_year=2025,embargo_bars=5,bootstrap_reps=500,resume=True,
                   symbols=None,method_profile='paper',protocol='original',random_timing_reps=200,pbo_blocks=8,
-                  spa_reps=1000,method_configs=None,lockbox=None,unlock_lockbox=False,progress='auto'):
-    """``progress`` is a ProgressTracker or a mode (auto, bar, log, off); it never enters reports."""
+                  spa_reps=1000,method_configs=None,lockbox=None,unlock_lockbox=False,progress='auto',
+                  allow_data_quality_failures=False):
+    """``progress`` is a ProgressTracker or a mode (auto, bar, log, off); it never enters reports.
+
+    A ``quality.json`` from ``gen-trade audit-data`` in the data directory gates
+    the run: failed error checks refuse it unless ``allow_data_quality_failures``.
+    The audit used is copied to ``data-quality.json`` and summarized in the report.
+    """
     if method_configs is not None:
         method_profile='custom'
         if set(method_configs)!=set(METHOD_NAMES):
@@ -658,6 +679,7 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
     symbols=list(symbols) if symbols is not None else list(markets)
     if not symbols or len(set(symbols))!=len(symbols) or set(symbols)-set(markets):
         raise ValueError('Benchmark symbols must be a unique nonempty subset of the downloaded universe')
+    data_quality=benchmark_quality(data_directory,symbols,allow_failures=allow_data_quality_failures)
     if lockbox is None and (Path(__file__).resolve().parents[2]/LOCKBOX_FILE).exists():
         lockbox=Path(__file__).resolve().parents[2]/LOCKBOX_FILE
     lockbox_record=json.loads(Path(lockbox).read_text()) if lockbox else None
@@ -686,11 +708,19 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
     directory=Path(output_directory);directory.mkdir(parents=True,exist_ok=True)
     tracker=progress if isinstance(progress,ProgressTracker) else ProgressTracker(mode=progress)
     jobs_per_asset=(last_test_year-first_test_year+1)*len(seeds)*len(METHOD_NAMES)*(2 if rules['compare'].get('selection')=='pooled' else 1)
+    if data_quality.get('report_sha256'):
+        audit=(Path(data_directory)/QUALITY_FILE).read_bytes()
+        if hashlib.sha256(audit).hexdigest()!=data_quality['report_sha256']:
+            raise ValueError('quality.json changed while the benchmark started; rerun')
+        (directory/'data-quality.json').write_bytes(audit)
     for symbol in symbols:
         tracker.plan(symbol,jobs_per_asset)
     tracker.attach(directory,symbols)
+    tracker.note(f"Data quality: {data_quality['status']}"+('' if data_quality.get('report_sha256')
+                 else ' (run gen-trade audit-data on the dataset to gate benchmarks on it)'))
     try:
         summary=_run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candidates,seeds,lock,lockbox_record,
+                            data_quality=data_quality,
                             setup=setup,method_profile=method_profile,protocol=protocol,population_size=population_size,
                             generations=generations,workers=workers,first_test_year=first_test_year,
                             last_test_year=last_test_year,embargo_bars=embargo_bars,bootstrap_reps=bootstrap_reps,
@@ -706,7 +736,7 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
 
 def _run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candidates,seeds,lock,lockbox_record,*,
                 method_profile,protocol,population_size,generations,workers,first_test_year,last_test_year,
-                embargo_bars,bootstrap_reps,resume,random_timing_reps,pbo_blocks,spa_reps,setup=None):
+                embargo_bars,bootstrap_reps,resume,random_timing_reps,pbo_blocks,spa_reps,setup=None,data_quality=None):
     source_hash=_code_hash();reports={};audits={};start=perf_counter()
     policy=rules.get('liquidity_policy','flag')
     for symbol in symbols:
@@ -789,6 +819,7 @@ def _run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candid
              'exposure_controls':exposure_summary(reports),
              'pooled_controls':pooled_controls(reports,manifest),
              'dataset_manifest':manifest,
+             'data_quality':data_quality or {'status':'not audited'},
              'liquidity_screen':{'policy':policy,'instrument_years':[
                  {'symbol':symbol,'test_year':row['test_year'],'eligible':row['liquidity']['eligible'],
                   'traded':row['traded'],'reasons':row['liquidity']['reasons'],'metrics':row['liquidity']['metrics']}
@@ -907,7 +938,8 @@ def reanalyze(source_directory,output_directory,*,data_directory=None,random_tim
         raise ValueError('Cadence-aligned timing needs the data directory')
     events=posthoc_timing(reports,data_directory,settings,manifest,random_timing_reps,aligned_timing) if data_directory else []
     records,pairs,paths=summarize(reports,manifest,settings)
-    summary={**{key:old[key] for key in ('schema_version','data_kind','universe','settings','source_sha256') if key in old},
+    summary={**{key:old[key] for key in ('schema_version','data_kind','universe','settings','source_sha256','data_quality')
+                if key in old},
              'reanalysis':{'source_directory':str(source),'reanalysis_code_sha256':_code_hash(),
                            'posthoc_ring_random_timing_folds':sum(e['method']=='igtsp_ring' and not e['aligned'] for e in events),
                            'posthoc_aligned_random_timing_runs':sum(e['aligned'] for e in events),

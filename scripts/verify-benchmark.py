@@ -42,6 +42,15 @@ def verify(report_directory, data_directory, expected_source=None):
         setup = validate_setup(summary["setup"])
         require(setup["setup_version"] == rules["setup_version"] == settings["setup_version"], "Setup version differs")
         require(settings["setup_sha256"] == setup["setup_sha256"], "Setup hash differs from the run settings")
+    quality = summary.get("data_quality") or {}
+    if quality.get("report_sha256"):
+        # The data-quality audit the run relied on is archived beside it and
+        # must still describe the current dataset manifest.
+        archived = (directory / "data-quality.json").read_bytes()
+        require(hashlib.sha256(archived).hexdigest() == quality["report_sha256"], "Archived data-quality audit differs")
+        manifest_sha = hashlib.sha256((Path(data_directory) / "manifest.json").read_bytes()).hexdigest()
+        require(json.loads(archived)["manifest_sha256"] == manifest_sha, "Data-quality audit is for a different manifest")
+        require(quality["status"] != "fail" or quality.get("failures_allowed"), "Failed data-quality audit was not allowed")
     policy = rules.get("liquidity_policy", "flag")
     years = list(range(settings["first_test_year"], settings["last_test_year"] + 1))
 

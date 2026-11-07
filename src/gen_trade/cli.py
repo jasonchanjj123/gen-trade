@@ -22,6 +22,18 @@ def main(argv=None) -> int:
     fetch.add_argument('--refresh',action='store_true')
     fetch.add_argument('--universe',choices=('default','lockbox'),default='default',
                        help='default: the six research instruments; lockbox: the rule-based held-out universe')
+    fetch.add_argument('--no-audit',action='store_true',help='Skip the data-quality audit after fetching')
+    fetch.add_argument('--no-ecb',action='store_true',help='Audit without reconciling FX against ECB reference rates')
+    audit=commands.add_parser('audit-data',help='Audit data: contracts, completeness, anomalies, reconciliation and lineage')
+    audit.add_argument('path',nargs='?',type=Path,default=Path('data/stocks-fx-2015-2025'),
+                       help='Dataset directory (with manifest.json) or a CSV/Parquet market file')
+    audit.add_argument('--ecb',action='store_true',help='Reconcile FX pairs with ECB reference rates (downloaded once into raw/ECB)')
+    audit.add_argument('--reference',type=Path,help='Independent reference prices: symbol, session_date, value, kind (close|fix)[, source]')
+    audit.add_argument('--exceptions',type=Path,
+                       help='Reviewed-exceptions register (default: data-quality-exceptions.json in the repository root, if present)')
+    audit.add_argument('--no-rebuild',action='store_true',help='Skip rebuilding dataset files from the raw cache')
+    audit.add_argument('--output',type=Path,help='Report path (default: quality.json in a dataset directory; a file is only printed)')
+    audit.add_argument('--strict',action='store_true',help='Also exit nonzero while warnings remain unreviewed')
     benchmark=commands.add_parser('benchmark',help='Run all three methods on calendar-year stock/FX folds')
     benchmark.add_argument('--data-directory',type=Path,default=Path('data/stocks-fx-2015-2025'))
     benchmark.add_argument('--output',type=Path,default=Path('reports/stocks-fx-2015-2025'))
@@ -58,6 +70,8 @@ def main(argv=None) -> int:
     freeze.add_argument('--hypotheses',type=Path,help='JSON list of pre-registered hypotheses (evaluated when the lockbox is unlocked)')
     freeze.add_argument('--universe',choices=('lockbox',),help='Use the rule-based lockbox universe for --symbols and record its rule')
     benchmark.add_argument('--random-timing-reps',type=int,default=200)
+    benchmark.add_argument('--allow-data-quality-failures',action='store_true',
+                           help="Run although the dataset's quality.json has failed error checks (recorded in the report)")
     status=commands.add_parser('status',help='Show the progress of running or finished benchmarks')
     status.add_argument('runs',nargs='*',type=Path,help='Benchmark output directories (default: every run under --root)')
     status.add_argument('--root',type=Path,default=Path('reports'),help='Where to look for runs when none is named')
@@ -118,7 +132,13 @@ def main(argv=None) -> int:
             manifest=fetch_dataset(args.directory,start=args.start,end=args.end,refresh=args.refresh,
                                    stocks=stocks,fx_pairs=fx_pairs,universe_selection=rule)
             print(f"Verified {len(manifest['universe'])} instruments in {args.directory}")
-            return 0
+            if args.no_audit:
+                return 0
+            return _audit(args.directory,ecb=bool(fx_pairs) and not args.no_ecb,reference=None,exceptions=None,
+                          rebuild=True,output=None,strict=False)
+        if args.command=='audit-data':
+            return _audit(args.path,ecb=args.ecb,reference=args.reference,exceptions=args.exceptions,
+                          rebuild=not args.no_rebuild,output=args.output,strict=args.strict)
         if args.command=='setup':
             from .setup import canonical_setup
             declaration=canonical_setup(args.method_profile,data_directory=args.data_directory,
@@ -147,6 +167,7 @@ def main(argv=None) -> int:
                           protocol=args.protocol,random_timing_reps=args.random_timing_reps,
                           method_configs=json.loads(args.method_configs.read_text()) if args.method_configs else None,
                           lockbox=args.lockbox,unlock_lockbox=args.unlock_lockbox,
+                          allow_data_quality_failures=args.allow_data_quality_failures,
                           progress=ProgressTracker(mode=args.progress,command=command_line))
             return 0
         if args.command=='freeze-profiles':
@@ -197,6 +218,38 @@ def main(argv=None) -> int:
     except (ValueError,KeyError,RuntimeError,OSError,TypeError) as exc:
         print(f"Experiment failed: {exc}",file=sys.stderr)
         return 2
+
+
+QUALITY_EXIT = 3
+
+
+def _audit(path, *, ecb, reference, exceptions, rebuild, output, strict) -> int:
+    """Run the data-quality audit, write its report, print the scorecard.
+
+    Exit status 3 when an error check fails (or, with ``strict``, while
+    warnings remain unreviewed); 0 otherwise.
+    """
+    from .data_quality import QUALITY_FILE, audit_dataset, audit_market_file, format_scorecard, write_report
+    path = Path(path)
+    if path.is_dir():
+        try:
+            report = audit_dataset(path, ecb=ecb, reference=reference, exceptions=exceptions, rebuild=rebuild)
+        except RuntimeError as exc:
+            if not ecb:
+                raise
+            print(f"ECB reference rates unavailable ({exc}); auditing without them.", file=sys.stderr)
+            report = audit_dataset(path, reference=reference, exceptions=exceptions, rebuild=rebuild)
+        target = output or path / QUALITY_FILE
+    else:
+        if ecb:
+            raise ValueError('--ecb needs a fetch-data dataset directory; supply FX fixes with --reference instead')
+        report = audit_market_file(path, reference=reference, exceptions=exceptions)
+        target = output
+    print(format_scorecard(report))
+    if target:
+        print(f"Wrote {write_report(report, target)}")
+    failing = report['status'] == 'fail' or (strict and report['status'] == 'warn')
+    return QUALITY_EXIT if failing else 0
 
 
 if __name__ == "__main__":

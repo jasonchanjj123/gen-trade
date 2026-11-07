@@ -74,6 +74,12 @@ provider's UTC candle-bucket labels; opening prices are the bucket's first quote
 price, not a guarantee of an executable quote at midnight on a partial/holiday
 session. Finer execution-time or intrabar claims require finer data.
 
+Two retained Dukascopy candles are partial feed records: EUR/USD 2016-06-08 and
+USD/JPY 2017-07-12, each with about 1% or less of normal feed activity. Both lie
+in training years only. The data-quality audit flags them, and the ECB reference
+fix confirms the EUR/USD one. They are kept so that the dataset matches earlier
+reports. See [data sources and quality](DATA_QUALITY.md).
+
 Every dataset includes timezone-aware bar start and full-candle availability time.
 Signals see only completed observations and execute at the following bar's open.
 FX daily availability is conservatively set to the next UTC day. Stops and targets
