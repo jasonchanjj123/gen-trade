@@ -38,8 +38,15 @@ def main(argv=None) -> int:
     benchmark.add_argument('--method-profile',choices=('paper','improved','robust','robust_weekly','robust_monthly'),default='paper',
                            help='paper-faithful candidates, or labeled extension variants (docs/EXTENSIONS.md)')
     benchmark.add_argument('--method-configs',type=Path,help='JSON mapping every method to its candidate list (profile "custom")')
-    benchmark.add_argument('--protocol',choices=('original','audited','audited2'),default='original',
-                           help='original; audited (pooled seed selection, validated deployment, exposure controls, audited costs); audited2 (audited + blend-excess validation score)')
+    benchmark.add_argument('--protocol',choices=('original','audited','audited2','v1'),default='original',
+                           help='original; audited (pooled seed selection, validated deployment, exposure controls, audited costs); audited2 (audited + blend-excess validation score); v1 (audited2 + enforced liquidity screen and trading-session embargo checks, setup_version v1 stamped into reports; docs/SETUP_V1.md)')
+    setup=commands.add_parser('setup',help='Print the setup v1 declaration (universe, schedule, information, mapping, risk, costs, evaluation)')
+    setup.add_argument('--data-directory',type=Path,
+                       help='Dataset whose instruments and universe rule to declare (default: the six research instruments)')
+    setup.add_argument('--method-profile',choices=('paper','improved','robust','robust_weekly','robust_monthly'),default='paper')
+    setup.add_argument('--first-test-year',type=int,default=2019)
+    setup.add_argument('--last-test-year',type=int,default=2025)
+    setup.add_argument('--output',type=Path,help='Write the JSON here instead of printing it')
     benchmark.add_argument('--lockbox',type=Path,help='Lockbox declaration (default: lockbox.json in the repository root, if present)')
     benchmark.add_argument('--unlock-lockbox',action='store_true',help='Run held-out lockbox data once with a frozen profile')
     freeze=commands.add_parser('freeze-profiles',help='Declare a lockbox and freeze method profiles before touching it')
@@ -111,6 +118,18 @@ def main(argv=None) -> int:
             manifest=fetch_dataset(args.directory,start=args.start,end=args.end,refresh=args.refresh,
                                    stocks=stocks,fx_pairs=fx_pairs,universe_selection=rule)
             print(f"Verified {len(manifest['universe'])} instruments in {args.directory}")
+            return 0
+        if args.command=='setup':
+            from .setup import canonical_setup
+            declaration=canonical_setup(args.method_profile,data_directory=args.data_directory,
+                                        first_test_year=args.first_test_year,last_test_year=args.last_test_year)
+            text=json.dumps(declaration,indent=2,allow_nan=False)+"\n"
+            if args.output:
+                args.output.parent.mkdir(parents=True,exist_ok=True)
+                args.output.write_text(text)
+                print(f"Wrote setup {declaration['setup_version']} ({declaration['setup_sha256'][:16]}…) to {args.output}")
+            else:
+                print(text,end="")
             return 0
         if args.command=='reanalyze':
             from .benchmark import reanalyze as run_reanalysis

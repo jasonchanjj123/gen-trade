@@ -17,9 +17,12 @@ from .instruments import benchmark_spec
 from .market_data import load_dataset, merge_fx_weekend_stubs
 from .progress import ProgressTracker
 from .runner import Fold,compare_methods
+from .setup import BENCHMARK_SLIPPAGE_BPS,build_setup,fold_audit,validate_setup
 from .statistics import (deflated_sharpe_ratio,detailed_statistics,excess_over_blend,holm_adjust,paired_comparison,
                          pbo_cscv,probabilistic_sharpe_ratio,rademacher_antiserum,spa_excess,spa_test,stepm_excess)
 
+_AUDITED2_COMPARE={'selection':'pooled','deploy':'validated','min_validation_trades':2,
+                   'validation_curves':True,'exposure_controls_enabled':True,'validation_metric':'blend_excess'}
 PROTOCOLS = {
     'original':{'compare':{}, 'fx_financing':.02, 'stock_minimum_spread':0., 'merge_fx_weekend_stubs':False},
     # EXTENSION (docs/EXTENSIONS.md): audit items 3, 6, 8 and 13.
@@ -28,9 +31,14 @@ PROTOCOLS = {
                'fx_financing':0., 'stock_minimum_spread':.01, 'merge_fx_weekend_stubs':True},
     # EXTENSION (review 2026-11-05): audited, plus configuration choice on the
     # validation information ratio of excess over the exposure-matched blend.
-    'audited2':{'compare':{'selection':'pooled','deploy':'validated','min_validation_trades':2,
-                           'validation_curves':True,'exposure_controls_enabled':True,'validation_metric':'blend_excess'},
+    'audited2':{'compare':dict(_AUDITED2_COMPARE),
                 'fx_financing':0., 'stock_minimum_spread':.01, 'merge_fx_weekend_stubs':True},
+    # Setup v1 (docs/SETUP_V1.md): audited2, plus the point-in-time liquidity
+    # screen enforced per instrument-year, embargoes checked in trading
+    # sessions, and the full setup declaration stamped into every report.
+    'v1':{'compare':dict(_AUDITED2_COMPARE),
+          'fx_financing':0., 'stock_minimum_spread':.01, 'merge_fx_weekend_stubs':True,
+          'liquidity_policy':'exclude', 'setup_version':'v1'},
 }
 LOCKBOX_FILE='lockbox.json'
 
@@ -509,6 +517,23 @@ def _render_report(directory,summary,paths):
         aligned=summary['reanalysis'].get('posthoc_aligned_random_timing_runs',0)
         lines[2:2]=[f"Reanalysis of `{summary['reanalysis']['source_directory']}` with the current statistics; per-asset reports unchanged, no strategy refitted. Ring random timing added post hoc for {summary['reanalysis']['posthoc_ring_random_timing_folds']} fold-seed runs"
                     +(f"; random timing recomputed with cadence-aligned placements for {aligned} method runs." if aligned else "."),'']
+    if summary.get('setup'):
+        setup=summary['setup'];rule=setup['trading_universe']['liquidity_filters']
+        lines+=['',f"## Setup {setup['setup_version']}",'',
+                f"Declared in `summary.json` (`setup`), sha256 `{setup['setup_sha256'][:16]}…`; see docs/SETUP_V1.md. "
+                f"Embargo: {setup['evaluation']['embargo']['trading_sessions']} trading sessions after training and after validation. "
+                f"Liquidity screen ({rule['policy']}): stocks need a median price of at least ${rule['min_median_price']:g}, median dollar volume of at least "
+                f"${rule['min_median_dollar_volume']/1e6:g}M and an order of at most {rule['max_participation']:.0%} of it over the {rule['lookback_sessions']} sessions before the test embargo; FX must be a G10 currency against USD."]
+    screen=summary.get('liquidity_screen')
+    if screen and screen['instrument_years']:
+        failed=[row for row in screen['instrument_years'] if not row['eligible']]
+        lines+=['','## Liquidity screen','',
+                f"Policy: **{screen['policy']}** ({'failing instrument-years are not traded or evaluated' if screen['policy']=='exclude' else 'flag only; failing instrument-years are still traded'})."]
+        if failed:
+            lines+=['','| Instrument | Test year | Traded | Reasons |','| --- | --- | --- | --- |']
+            lines+=[f"| {row['symbol']} | {row['test_year']} | {'yes' if row['traded'] else 'no'} | {'; '.join(row['reasons'])} |" for row in failed]
+        else:
+            lines.append(f"All {len(screen['instrument_years'])} instrument-years pass.")
     settings=summary['settings']
     extended=settings.get('protocol','original')!='original' or settings.get('method_profile','paper')!='paper'
     if extended:
@@ -650,6 +675,14 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
                         random_timing_reps=random_timing_reps)
     if lock and lock.get('lockbox_touched'):
         settings['lockbox']=lock
+    setup=None
+    if rules.get('setup_version'):
+        setup=validate_setup(build_setup(symbols=symbols,method_profile=method_profile,candidates=candidates,rules=rules,
+            first_test_year=first_test_year,last_test_year=last_test_year,train_years=settings['train_years'],
+            validation_years=settings['validation_years'],embargo_sessions=embargo_bars,
+            initial_cash=settings['initial_cash'],seeds=seeds,population_size=population_size,generations=generations,
+            universe_rule=manifest.get('universe_selection'),lockbox=lockbox_record))
+        settings.update(setup_version=setup['setup_version'],setup_sha256=setup['setup_sha256'])
     directory=Path(output_directory);directory.mkdir(parents=True,exist_ok=True)
     tracker=progress if isinstance(progress,ProgressTracker) else ProgressTracker(mode=progress)
     jobs_per_asset=(last_test_year-first_test_year+1)*len(seeds)*len(METHOD_NAMES)*(2 if rules['compare'].get('selection')=='pooled' else 1)
@@ -658,7 +691,7 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
     tracker.attach(directory,symbols)
     try:
         summary=_run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candidates,seeds,lock,lockbox_record,
-                            method_profile=method_profile,protocol=protocol,population_size=population_size,
+                            setup=setup,method_profile=method_profile,protocol=protocol,population_size=population_size,
                             generations=generations,workers=workers,first_test_year=first_test_year,
                             last_test_year=last_test_year,embargo_bars=embargo_bars,bootstrap_reps=bootstrap_reps,
                             resume=resume,random_timing_reps=random_timing_reps,pbo_blocks=pbo_blocks,spa_reps=spa_reps)
@@ -673,8 +706,9 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
 
 def _run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candidates,seeds,lock,lockbox_record,*,
                 method_profile,protocol,population_size,generations,workers,first_test_year,last_test_year,
-                embargo_bars,bootstrap_reps,resume,random_timing_reps,pbo_blocks,spa_reps):
-    source_hash=_code_hash();reports={};start=perf_counter()
+                embargo_bars,bootstrap_reps,resume,random_timing_reps,pbo_blocks,spa_reps,setup=None):
+    source_hash=_code_hash();reports={};audits={};start=perf_counter()
+    policy=rules.get('liquidity_policy','flag')
     for symbol in symbols:
         spec=benchmark_spec(symbol,fx_financing=rules['fx_financing'],stock_minimum_spread=rules['stock_minimum_spread'])
         stress_spec=benchmark_spec(symbol,stress=True,fx_financing=rules['fx_financing'],
@@ -687,6 +721,8 @@ def _run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candid
             if cached.get('benchmark_signature')!=signature:
                 raise ValueError(f'{symbol}: existing report belongs to different code/data/settings; use a new output directory or no-resume')
             reports[symbol]=cached
+            if cached.get('fold_audit'):
+                audits[symbol]=cached['fold_audit']
             tracker.resume(symbol)
             tracker.note(f'Verified completed asset: {symbol}')
             continue
@@ -699,29 +735,52 @@ def _run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candid
             periods_per_year=float(len(frame)/span)
         run_markets={**markets,symbol:frame}
         folds=calendar_folds(frame,first_test_year=first_test_year,last_test_year=last_test_year,embargo_bars=embargo_bars)
-        tracker.note(f'Running {symbol}: {len(folds)} calendar folds × {len(seeds)} seeds × 3 methods')
+        audit=fold_audit(frame,folds,range(first_test_year,last_test_year+1),embargo_sessions=embargo_bars,
+                         capital=settings['initial_cash'])
+        if rules.get('setup_version'):
+            failed=[row['test_year'] for row in audit if not (row['embargo_ok'] and row['warmup_ok'])]
+            if failed:
+                raise ValueError(f"{symbol}: setup {rules['setup_version']} needs embargoes of {embargo_bars} trading "
+                                 f'sessions and training longer than the feature warm-up; test years {failed} fail')
+        keep=[i for i,row in enumerate(audit) if policy!='exclude' or row['liquidity']['eligible']]
+        for i,row in enumerate(audit):
+            row['traded']=i in keep
+        audits[symbol]=audit
+        if not keep:
+            tracker.plan(symbol,0);tracker.asset_finished(symbol)
+            tracker.note(f'Excluded {symbol}: no test year passes the liquidity screen')
+            continue
+        screened=[row['test_year'] for row in audit if not row['traded']]
+        tracker.note(f'Running {symbol}: {len(keep)} calendar folds × {len(seeds)} seeds × 3 methods'
+                     +(f'; liquidity screen excludes {screened}' if screened else ''))
         report=compare_methods(run_markets,ChromosomeContext(symbol),train_bars=756,validation_bars=252,test_bars=252,
-            embargo_bars=embargo_bars,max_folds=len(folds),population_size=population_size,generations=generations,
-            seeds=tuple(seeds),fee=0,slippage_bps=1 if '/' not in symbol else .1,
+            embargo_bars=embargo_bars,max_folds=len(keep),population_size=population_size,generations=generations,
+            seeds=tuple(seeds),fee=0,slippage_bps=BENCHMARK_SLIPPAGE_BPS['fx' if '/' in symbol else 'stock'],
             periods_per_year=periods_per_year,bootstrap_reps=bootstrap_reps,
             workers=workers,instrument=spec,stress_instrument=stress_spec,
-            initial_cash=100000,fold_plan=folds,include_paths=True,on_no_eligible='cash',
+            initial_cash=settings['initial_cash'],fold_plan=[folds[i] for i in keep],fold_numbers=keep,
+            include_paths=True,on_no_eligible='cash',
             method_configs={name:list(values) for name,values in candidates.items()},
             random_timing_reps=random_timing_reps,progress=tracker,**rules['compare'])
         report.update(benchmark_signature=signature,data_provenance=manifest['instruments'][symbol],
-                      calendar_protocol={'training_years':3,'validation_years':1,'test_years':list(range(first_test_year,last_test_year+1))})
+                      calendar_protocol={'training_years':3,'validation_years':1,'test_years':list(range(first_test_year,last_test_year+1))},
+                      fold_audit=audit,liquidity_policy=policy)
         if method_profile!='paper' or protocol!='original':
             report.update(periods_per_year_used=periods_per_year,merged_fx_weekend_stubs=merged_stubs,
                           method_profile=method_profile,benchmark_protocol=protocol)
+        if setup:
+            report.update(setup_version=setup['setup_version'],setup_sha256=setup['setup_sha256'])
         if not isinstance(report.get('protocol'),dict):
             raise ValueError(f'{symbol}: report protocol block was overwritten')
         temporary=path.with_suffix('.json.tmp');temporary.write_text(json.dumps(report,allow_nan=False)+'\n');temporary.replace(path)
         reports[symbol]=report
         tracker.asset_finished(symbol)
         tracker.note(f'Finished {symbol}: {len(report["folds"])*3} method runs saved')
+    if not reports:
+        raise ValueError('No instrument has a test year that passes the liquidity screen')
     tracker.stage('summarizing: selection bias, SPA, pooled controls and report')
     records,pairs,paths=summarize(reports,manifest,settings)
-    summary={'schema_version':2,'data_kind':'real historical market data','universe':symbols,'settings':settings,
+    summary={'schema_version':2,'data_kind':'real historical market data','universe':list(reports),'settings':settings,
              'source_sha256':source_hash,'elapsed_seconds':perf_counter()-start,'runs':records,'paired_comparisons':pairs,
              'method_runs':sum(len(report['folds'])*3 for report in reports.values()),
              'cash_fallback_method_folds':sum(row['cash_fallback_folds'] for row in records if row['seed']!='ensemble'),
@@ -729,7 +788,15 @@ def _run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candid
              'selection_bias':selection_bias(reports,manifest,settings,paths,blocks=pbo_blocks,spa_reps=spa_reps),
              'exposure_controls':exposure_summary(reports),
              'pooled_controls':pooled_controls(reports,manifest),
-             'dataset_manifest':manifest}
+             'dataset_manifest':manifest,
+             'liquidity_screen':{'policy':policy,'instrument_years':[
+                 {'symbol':symbol,'test_year':row['test_year'],'eligible':row['liquidity']['eligible'],
+                  'traded':row['traded'],'reasons':row['liquidity']['reasons'],'metrics':row['liquidity']['metrics']}
+                 for symbol,audit in audits.items() for row in audit]}}
+    if len(reports)<len(symbols):
+        summary.update(requested_universe=list(symbols),excluded_instruments=sorted(set(symbols)-set(reports)))
+    if setup:
+        summary['setup']=setup
     if lock and lock.get('lockbox_touched') and lockbox_record.get('hypotheses'):
         summary['preregistered_tests']=evaluate_hypotheses(lockbox_record['hypotheses'],method_profile=method_profile,
                                                            protocol=protocol,reports=reports,manifest=manifest,

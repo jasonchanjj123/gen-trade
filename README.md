@@ -194,6 +194,21 @@ code, execution, fold, and seed context. Cache failure means recompute. The
 optimizers currently use fit-local memoization; the Redis helper is available
 to an orchestration layer and is not silently enabled inside their fitness loops.
 
+## Trading setup v1
+
+The declared trading setup and evaluation protocol is `setup_version: v1`
+([docs/SETUP_V1.md](docs/SETUP_V1.md); audit in [docs/SETUP_AUDIT.md](docs/SETUP_AUDIT.md)).
+It covers universe and liquidity filters, decision schedule, admissible
+information, score-to-trade mapping, risk constraints, costs, and the
+walk-forward windows, label horizon, feature lookback, purging and embargo.
+`--protocol v1` enforces it and stamps it into every report:
+
+```bash
+gen-trade setup                                   # the v1 declaration as JSON
+gen-trade benchmark --protocol v1 --method-profile robust --output reports/v1-robust
+python scripts/verify-benchmark.py reports/v1-robust
+```
+
 ## Theory and audit extensions
 
 Labeled, opt-in method variants and an audited benchmark protocol are documented

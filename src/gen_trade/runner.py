@@ -27,6 +27,9 @@ from .statistics import (alpha_beta, detailed_statistics, exposure_matched_blend
                          paired_comparison, random_aligned_signals, random_interval_signals)
 
 SELECTION_SCOPES = ("per_seed", "pooled")
+# MOO3 evolves entries only; its exit is this calendar-day holding deadline or
+# a profit target observed at a close (docs/PAPER_METHODS.md).
+MOO3_EXIT = {"max_holding_days":5, "take_profit":.05}
 
 
 def exposure_controls(name, result, baseline, test, execution, *, periods_per_year, bootstrap_reps, seed,
@@ -227,7 +230,7 @@ def compare_methods(
     selection: str = "per_seed", deploy: str = "refit", min_validation_trades: int = 1,
     validation_curves: bool = False, exposure_controls_enabled: bool = False, random_timing_reps: int = 200,
     validation_metric: str = "log_wealth_minus_drawdown",
-    progress=None,
+    progress=None, fold_numbers: list[int] | None = None,
 ) -> dict:
     """Compare documented adaptations; common costs/settings, frozen training fits.
 
@@ -278,6 +281,13 @@ def compare_methods(
             raise ValueError('Invalid validation bounds')
     if any(a.test_stop>b.test_start for a,b in zip(folds,folds[1:])):
         raise ValueError('Held-out folds must not overlap')
+    # Fold numbers set each fold's index and seed offset. A plan with some folds
+    # left out (setup v1 liquidity screen) passes their full-plan positions so
+    # the remaining folds keep the seeds they would have had.
+    numbers = list(range(len(folds))) if fold_numbers is None else list(fold_numbers)
+    if (len(numbers) != len(folds) or any(type(n) is not int or n < 0 for n in numbers)
+            or any(a >= b for a, b in zip(numbers, numbers[1:]))):
+        raise ValueError("fold_numbers must be increasing nonnegative integers, one per fold")
     data_hash = hashlib.sha256()
     for symbol, source in sorted(markets.items()):
         data_hash.update(symbol.encode())
@@ -325,14 +335,14 @@ def compare_methods(
     }
     pending = []
     records = []
-    for fold_index, fold in enumerate(folds):
+    for fold_index, fold in zip(numbers, folds):
         train = bars.iloc[fold.train_start:fold.train_stop].reset_index(drop=True)
         test = bars.iloc[fold.test_start:fold.test_stop].reset_index(drop=True)
         history = bars.iloc[fold.train_start:fold.test_stop].reset_index(drop=True)
         features = align_features(history, markets, context.features)
         executions = {
-            "moo3":ExecutionConfig(fee=fee,slippage_bps=slippage_bps,max_holding_days=5,
-                                   take_profit=.05,entry_hours=context.entry_hours,initial_cash=initial_cash,instrument=instrument),
+            "moo3":ExecutionConfig(fee=fee,slippage_bps=slippage_bps,**MOO3_EXIT,
+                                   entry_hours=context.entry_hours,initial_cash=initial_cash,instrument=instrument),
             "mstgam":ExecutionConfig(fee=fee,slippage_bps=slippage_bps,entry_hours=context.entry_hours,initial_cash=initial_cash,instrument=instrument),
             "igtsp_ring":ExecutionConfig(fee=fee,slippage_bps=slippage_bps,entry_hours=context.entry_hours,initial_cash=initial_cash,instrument=instrument),
         }
@@ -364,7 +374,7 @@ def compare_methods(
 
     def describe(index, name, phase=None):
         fold_report = records[index][0]
-        return {"asset":context.pair, "fold":fold_report["index"] + 1, "folds":len(folds),
+        return {"asset":context.pair, "fold":fold_report["index"] + 1, "folds":numbers[-1] + 1,
                 "test_start":fold_report["test_first_open"][:10], "seed":fold_report["base_seed"],
                 "method":name, "phase":phase}
 

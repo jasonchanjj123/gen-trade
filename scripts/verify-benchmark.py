@@ -10,10 +10,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from gen_trade.benchmark import PROTOCOLS, _code_hash
+from gen_trade.benchmark import PROTOCOLS, _code_hash, calendar_folds
 from gen_trade.experiments import METHOD_NAMES
 from gen_trade.instruments import benchmark_spec
 from gen_trade.market_data import load_dataset, merge_fx_weekend_stubs
+from gen_trade.setup import fold_audit, validate_setup
 
 
 def require(condition, message):
@@ -37,11 +38,45 @@ def verify(report_directory, data_directory, expected_source=None):
     require(summary["dataset_manifest"] == manifest, "Dataset manifest differs from benchmark")
     for name in ("report.md", "equity.png"):
         require((directory / name).stat().st_size > 0, f"Missing/empty {name}")
+    if rules.get("setup_version"):
+        setup = validate_setup(summary["setup"])
+        require(setup["setup_version"] == rules["setup_version"] == settings["setup_version"], "Setup version differs")
+        require(settings["setup_sha256"] == setup["setup_sha256"], "Setup hash differs from the run settings")
+    policy = rules.get("liquidity_policy", "flag")
+    years = list(range(settings["first_test_year"], settings["last_test_year"] + 1))
+
+    def recomputed_audit(symbol):
+        """Rebuild the fold audit (embargo sessions, warm-up, liquidity) from the dataset."""
+        bars = markets[symbol]
+        if rules["merge_fx_weekend_stubs"] and "/" in symbol:
+            bars, _ = merge_fx_weekend_stubs(bars)
+        folds = calendar_folds(bars, first_test_year=settings["first_test_year"],
+                               last_test_year=settings["last_test_year"], embargo_bars=settings["embargo_bars"])
+        return fold_audit(bars, folds, years, embargo_sessions=settings["embargo_bars"], capital=settings["initial_cash"])
+
+    for symbol in summary.get("excluded_instruments", []):
+        require(policy == "exclude", f"{symbol}: excluded without an exclusion policy")
+        require(not any(row["liquidity"]["eligible"] for row in recomputed_audit(symbol)),
+                f"{symbol}: excluded although a test year passes the liquidity screen")
     paths = trades = methods = fallbacks = 0
     maximum_error = 0.0
     family_keys = set()
     for symbol in summary["universe"]:
         asset = json.loads((directory / (symbol.replace("/", "_") + ".json")).read_text())
+        traded_years = set(years)
+        if "fold_audit" in asset:
+            stored, rebuilt = asset["fold_audit"], recomputed_audit(symbol)
+            for row, check in zip(stored, rebuilt):
+                require(row["liquidity"] == check["liquidity"] and row["embargo_sessions"] == check["embargo_sessions"],
+                        f"{symbol} {row['test_year']}: fold audit differs from the dataset")
+                require(row["traded"] == (policy != "exclude" or row["liquidity"]["eligible"]),
+                        f"{symbol} {row['test_year']}: traded flag contradicts the liquidity policy")
+                if rules.get("setup_version"):
+                    require(row["embargo_ok"] and row["warmup_ok"], f"{symbol} {row['test_year']}: embargo/warm-up check failed")
+            require(len(stored) == len(rebuilt), f"{symbol}: fold audit is incomplete")
+            traded_years = {row["test_year"] for row in stored if row["traded"]}
+        if rules.get("setup_version"):
+            require(asset.get("setup_sha256") == settings["setup_sha256"], f"{symbol}: setup hash differs")
         signature = hashlib.sha256(json.dumps({
             "settings": settings, "data": manifest["instruments"][symbol]["sha256"],
             "source": source, "instrument": asdict(spec(symbol)),
@@ -99,8 +134,7 @@ def verify(report_directory, data_directory, expected_source=None):
                 for trade in case["trades"]:
                     require(trade["entry_time"] <= trade["exit_time"], "Trade exits before entry")
                     require(trade["account_currency"] == "USD", "Unexpected account currency")
-        expected = {(seed, year) for seed in settings["seeds"]
-                    for year in range(settings["first_test_year"], settings["last_test_year"] + 1)}
+        expected = {(seed, year) for seed in settings["seeds"] for year in traded_years}
         require(seen == expected, f"{symbol}: a requested seed/year is absent")
         family_keys.update((symbol, seed, first, second) for seed in settings["seeds"]
                            for index, first in enumerate(METHOD_NAMES) for second in METHOD_NAMES[index + 1:])
@@ -119,7 +153,10 @@ def verify(report_directory, data_directory, expected_source=None):
             "method_runs": methods, "primary_and_stress_paths": paths, "trade_ledger_rows": trades,
             "paired_test_family_size": len(family_keys), "cash_fallback_method_folds": fallbacks,
             "maximum_cash_reconciliation_error_usd": maximum_error,
-            "checks": ["current code/lock and dataset hashes", "all declared instruments/seeds/years/methods",
+            "excluded_instruments": summary.get("excluded_instruments", []),
+            "checks": ["current code/lock and dataset hashes", "setup declaration and hash (setup protocols)",
+                       "liquidity screen, embargo sessions and warm-up recomputed from the dataset",
+                       "all declared instruments/seeds/traded years/methods",
                        "train/validation/refit/test chronology and embargoes", "identical held-out timestamps",
                        "cash and cost ledger conservation", "summary and paired-test family completeness"]}
 

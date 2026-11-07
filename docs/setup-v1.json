@@ -1,0 +1,304 @@
+{
+  "setup_version": "v1",
+  "method_profile": "paper",
+  "trading_universe": {
+    "asset_selection": {
+      "instruments": {
+        "stocks": [
+          "AAPL",
+          "GM",
+          "GRPN"
+        ],
+        "fx": [
+          "EUR/USD",
+          "GBP/USD",
+          "USD/JPY"
+        ]
+      },
+      "rule": "user-selected fixed instruments; no survivorship-free universe claim",
+      "accounts": "one independent USD account per instrument; no cross-asset portfolio",
+      "data_requirements": "complete XNYS regular sessions for stocks; observed Dukascopy bid/ask candles for FX, with crossed quotes quarantined",
+      "survivorship": "a fixed list chosen in advance; not a survivorship-free sample"
+    },
+    "liquidity_filters": {
+      "lookback_sessions": 63,
+      "min_median_price": 5.0,
+      "min_median_dollar_volume": 10000000.0,
+      "max_participation": 0.01,
+      "fx_currencies": [
+        "USD",
+        "EUR",
+        "JPY",
+        "GBP",
+        "CHF",
+        "AUD",
+        "NZD",
+        "CAD",
+        "NOK",
+        "SEK"
+      ],
+      "measured_on": "the 63 bars before the validation end, all known before the test embargo",
+      "stocks": "median raw close >= min_median_price, median close x volume >= min_median_dollar_volume, fold capital / median dollar volume <= max_participation",
+      "fx": "both currencies in fx_currencies with USD on one side, observed bid/ask quotes",
+      "policy": "exclude",
+      "on_failure": "the instrument-year is not traded or evaluated"
+    }
+  },
+  "decision_schedule": {
+    "bar": "one daily bar per session: XNYS regular session for stocks (09:30-16:00 ET, early closes respected); UTC calendar day for FX",
+    "signal_calculation_time": "at the bar's available_at (stocks: the session close; FX: 00:00 UTC after the candle), from bars whose available_at is at or before it",
+    "execution_time": "the next bar's open, and only if that open is at or after the signal bar's available_at; stocks fill at the next 09:30 ET open with spread and slippage, FX buys at the next candle's first ask and sells at its first bid",
+    "delay": {
+      "bars": 1,
+      "stocks": "one overnight, about 17.5 hours",
+      "fx": "none after the candle completes: the next candle's first quote at 00:00 UTC is assumed executable"
+    },
+    "decision_cadence": {
+      "moo3": [
+        "daily"
+      ],
+      "mstgam": [
+        "daily"
+      ],
+      "igtsp_ring": [
+        "daily"
+      ]
+    },
+    "exit_monitoring": "targets, stops and holding deadlines are checked at each close and filled at the next open; no intrabar fills",
+    "retraining_time": "once per test year, before its first session",
+    "entry_hours": "unrestricted"
+  },
+  "admissible_information": {
+    "point_in_time_rule": "a decision at bar t uses only rows with available_at <= available_at(t); cross-market features use a backward as-of join with a finite maximum age; lags and rolling windows are never backfilled",
+    "feature_lookbacks": {
+      "moo3": {
+        "finite_window_bars": 50,
+        "calendar_days": 50,
+        "detail": "SMA, CCI, RSI and Williams %R over 10-50 bars; ATR and EMA over 3-10 bars; scale-free OBV change over 20 bars; directional-change statistics over 3-50 calendar days"
+      },
+      "mstgam": {
+        "finite_window_bars": 0,
+        "calendar_days": 0,
+        "detail": "directional-change state machines at ten fixed thresholds; no fixed window"
+      },
+      "igtsp_ring": {
+        "finite_window_bars": 88,
+        "calendar_days": 0,
+        "detail": "21 TA-Lib rules; longest warm-up TRIX(30) = 88 bars, then MACD(12,26,9) = 33 and ADX(14) = 27"
+      },
+      "max_finite_window_bars": 88,
+      "recursive_state": "EMA, Wilder RSI/ATR/ADX, OBV, Parabolic SAR and directional-change trend state are recursive: they start at the fold's training start and run forward, so a test-year decision depends on every bar from the training start up to the decision bar and on none after it"
+    },
+    "data_publication_lags": {
+      "stock_ohlcv": "known at the session close (available_at = XNYS close); no further vendor delay is modeled",
+      "fx_ohlc": "known at 00:00 UTC after the candle (available_at = open + 1 day)",
+      "splits": "applied on the effective date; later split factors only undo the vendor's back-adjustment of earlier prices (regression-tested) and are never features",
+      "dividends": "cash entitlement on the ex-date open; adjusted closes are not used",
+      "vendor_revisions": "not reconstructed"
+    },
+    "fit_time_information": "scalers, directional-change thresholds and triggers, and the Ring rule bank are fitted on training rows only; configuration choice uses validation rows only; test rows are never used to fit or select",
+    "excluded": [
+      "dividend-adjusted closes",
+      "FX volume (not consolidated); volume rules leave the Ring pool",
+      "any row after the decision bar"
+    ],
+    "reporting_only": "annualization factors count bars per year over the whole dataset; they scale reported statistics and never enter fitting or selection"
+  },
+  "score_to_trade_mapping": {
+    "signal_alphabet": "+1 buy: enter long if flat; -1 sell: exit if long; 0: no action",
+    "entry": {
+      "moo3": "buy when the evolved Boolean rule tree is true at the close",
+      "mstgam": "buy when the buy side wins the weighted vote of 70 directional-change genes (hurdle: min_votes 2, min_votes 3)",
+      "igtsp_ring": "each sleeve buys when its TA-Lib buy rule fires"
+    },
+    "exit": {
+      "moo3": "holding deadline of 5 calendar days, or a +5% target observed at a close; no sell rule",
+      "mstgam": "sell when the sell side wins the vote",
+      "igtsp_ring": "the sleeve's sell rule, or an evolved take-profit in [0, 10%] or stop-loss in [0, 10%] observed at a close",
+      "all": "filled at the next open; a position still open at a window's last close is liquidated there with exit costs (sample_end)"
+    },
+    "sizing": {
+      "rule": "all allocated capital in fractional units at the fill price after costs",
+      "moo3_mstgam": "one position using the fold's whole capital",
+      "igtsp_ring": "capital split across groups by the evolved weights (equal weights in robust profiles), equally among each group's members, fixed for the year",
+      "fold_capital_usd": 100000
+    },
+    "no_trade_state": [
+      "signal 0 keeps the current state; a flat account stays in cash earning nothing",
+      "during indicator warm-up, undefined features never trigger",
+      "bars between weekly or monthly decision bars emit no action",
+      "conflicting Ring buy and sell rules hold",
+      "when no configuration has >= 2 validation trades, the method holds cash for the whole test year",
+      "an instrument-year that fails the liquidity screen is not traded"
+    ]
+  },
+  "risk_constraints": {
+    "leverage": "1x cash account; no borrowing",
+    "direction": "long only",
+    "exposure_limits": "gross exposure <= 100% of fold equity; no pyramiding; Ring sleeve allocations fixed at the fold start with no rebalancing or borrowing between sleeves",
+    "concentration": "100% in one instrument per account by design; Ring diversifies only across rules on that instrument",
+    "liquidity_participation": "order <= 1% of median session dollar volume (stocks)",
+    "margin": "maintenance-margin exit at 50% (inactive at 1x cash)",
+    "stops": "only Ring evolves stop losses; no account drawdown stop, volatility target or kill switch"
+  },
+  "cost_model": {
+    "commissions": {
+      "stock_usd_per_share": 0.005,
+      "stock_minimum_usd": 0.0,
+      "fx_bps_per_side": 0.35
+    },
+    "spreads": {
+      "stock_full_spread": "max(2 bps, USD 0.01)",
+      "fx": "observed bid/ask: buy at ask, sell at bid"
+    },
+    "slippage_bps_per_side": {
+      "stock": 1,
+      "fx": 0.1
+    },
+    "other_costs": {
+      "fx_financing_annual": 0.0,
+      "fx_financing_source": "primary: zero carry (sign of historical carry not modeled); stress: 2%/yr debit on held notional",
+      "dividends": "credited on the ex-date, no withholding tax",
+      "currency_conversion": "side-aware at contemporaneous bid/ask (USD/JPY)",
+      "market_impact": "not modeled; relies on the participation cap",
+      "taxes": "not modeled",
+      "idle_cash_interest": 0
+    },
+    "stress_scenario": {
+      "stock_full_spread": "max(4 bps, USD 0.02)",
+      "stock_usd_per_share": 0.01,
+      "fx_bps_per_side": 0.7,
+      "fx_financing_annual": 0.02,
+      "slippage_bps_per_side": {
+        "stock": 2,
+        "fx": 0.2
+      },
+      "models": "the same frozen strategies; nothing is refitted"
+    },
+    "applied_in": "training fitness, validation, test and the buy-and-hold baseline, through one engine"
+  },
+  "evaluation": {
+    "scheme": "rolling walk-forward on calendar years: train, embargo, validation, embargo, test",
+    "training_window": "3 calendar years before the validation year, minus the embargo",
+    "validation_window": "1 calendar year before the test year, minus the embargo",
+    "test_window": "one complete calendar year; every fold starts flat with fresh capital",
+    "step_size": "1 calendar year",
+    "retraining_frequency": "annual: a fresh fit per method, seed and test year; deployed model: the validated training-only model",
+    "label_horizon": {
+      "definition": "bars from a decision to the end of the return it earns in fitness or validation",
+      "execution_delay_bars": 1,
+      "moo3": "at most 5 calendar days (holding deadline)",
+      "mstgam": "unbounded until a sell vote; truncated at the window end",
+      "igtsp_ring": "unbounded until a sell rule, target or stop; truncated at the window end",
+      "daily_fitness": "one bar for marked-to-market daily fitness (robust profiles)"
+    },
+    "max_feature_lookback": {
+      "bars": 88,
+      "recursive_state": "EMA, Wilder RSI/ATR/ADX, OBV, Parabolic SAR and directional-change trend state are recursive: they start at the fold's training start and run forward, so a test-year decision depends on every bar from the training start up to the decision bar and on none after it",
+      "check": "training windows must exceed it (warmup_ok in fold_audit)"
+    },
+    "test_dates": {
+      "first": "2019-01-01",
+      "last": "2025-12-31",
+      "years": [
+        2019,
+        2020,
+        2021,
+        2022,
+        2023,
+        2024,
+        2025
+      ],
+      "lockbox": {
+        "first_test_year": 2026,
+        "held_out_instruments": 28
+      }
+    },
+    "purging": {
+      "method": "label truncation at every window boundary",
+      "rule": "fit receives only rows before the training end and validation scores only validation rows; positions open at a window's last close are liquidated there, so no training or validation label ends after its window",
+      "why_not_fixed_width": "MSTGAM and Ring holding periods are unbounded (p95 12-85 bars, maximum a full year in the audited2 runs), so a fixed purge would remove a year",
+      "tests": [
+        "tests/test_runner.py::test_future_price_changes_cannot_change_training_inputs_or_frozen_parameters",
+        "tests/test_runner.py::test_validation_selection_and_refit_never_see_held_out_prices",
+        "tests/test_backtest.py::test_terminal_liquidation_uses_final_close_and_records_boundary_convention"
+      ]
+    },
+    "embargo": {
+      "trading_sessions": 5,
+      "where": [
+        "training to validation",
+        "validation to test"
+      ],
+      "unit": "weekday trading sessions; FX Sunday stubs are merged first",
+      "covers": "the one-bar execution delay and MOO3's maximum holding period",
+      "check": "counted per fold in fold_audit; a shorter gap stops the run"
+    },
+    "fold_calendar": [
+      {
+        "test_year": 2019,
+        "training": "2015-01-01 to the last session before 2018-01-01, minus 5 sessions",
+        "validation": "2018-01-01 to the last session of 2018, minus 5 sessions",
+        "test": "2019-01-01 to 2019-12-31"
+      },
+      {
+        "test_year": 2020,
+        "training": "2016-01-01 to the last session before 2019-01-01, minus 5 sessions",
+        "validation": "2019-01-01 to the last session of 2019, minus 5 sessions",
+        "test": "2020-01-01 to 2020-12-31"
+      },
+      {
+        "test_year": 2021,
+        "training": "2017-01-01 to the last session before 2020-01-01, minus 5 sessions",
+        "validation": "2020-01-01 to the last session of 2020, minus 5 sessions",
+        "test": "2021-01-01 to 2021-12-31"
+      },
+      {
+        "test_year": 2022,
+        "training": "2018-01-01 to the last session before 2021-01-01, minus 5 sessions",
+        "validation": "2021-01-01 to the last session of 2021, minus 5 sessions",
+        "test": "2022-01-01 to 2022-12-31"
+      },
+      {
+        "test_year": 2023,
+        "training": "2019-01-01 to the last session before 2022-01-01, minus 5 sessions",
+        "validation": "2022-01-01 to the last session of 2022, minus 5 sessions",
+        "test": "2023-01-01 to 2023-12-31"
+      },
+      {
+        "test_year": 2024,
+        "training": "2020-01-01 to the last session before 2023-01-01, minus 5 sessions",
+        "validation": "2023-01-01 to the last session of 2023, minus 5 sessions",
+        "test": "2024-01-01 to 2024-12-31"
+      },
+      {
+        "test_year": 2025,
+        "training": "2021-01-01 to the last session before 2024-01-01, minus 5 sessions",
+        "validation": "2024-01-01 to the last session of 2024, minus 5 sessions",
+        "test": "2025-01-01 to 2025-12-31"
+      }
+    ],
+    "model_selection": {
+      "candidates_per_method": {
+        "moo3": 2,
+        "mstgam": 2,
+        "igtsp_ring": 2
+      },
+      "selection_scope": "pooled",
+      "validation_metric": "blend_excess",
+      "min_validation_trades": 2,
+      "deploy": "validated",
+      "test_used_for_selection": false
+    },
+    "search_budget": {
+      "population_size": 64,
+      "generations": 20,
+      "seeds": [
+        11,
+        22,
+        33
+      ]
+    }
+  },
+  "setup_sha256": "bc5263d21fdbe17b712645d0845847d5f8160afdef1e001801ab8b8b8ac5eddc"
+}
