@@ -3,12 +3,40 @@
 Every optimizer and the held-out backtest use the same prepared array engine.
 Daily candles cannot resolve intrabar stop order: exits observed at close fill
 next open. Corporate actions are applied before new orders on the effective date.
+
+The optional Rust engine (``gen_trade_native``) gives results identical to the
+Python reference below; ``execution_backend`` says which one runs.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from functools import cached_property
+import os
 import numpy as np
 import pandas as pd
 from .data import validate_bars
+
+try:
+    from gen_trade_native import execute_batch_arrays as _native_execute_batch_arrays
+except ImportError:
+    _native_execute_batch_arrays = None
+
+BACKEND_VARIABLE = 'GEN_TRADE_EXECUTION_BACKEND'
+_REASONS = ('signal','profit_target','stop_loss','margin_call','holding_deadline','sample_end')
+
+
+def execution_backend(backend=None) -> str:
+    """The engine ``execute_batch`` uses: 'rust' or 'python'.
+
+    ``backend`` is 'auto', 'python' or 'rust'. None reads GEN_TRADE_EXECUTION_BACKEND
+    (default 'auto'), so a whole run, spawned workers included, can be forced onto
+    the Python reference. 'auto' uses Rust when installed; 'rust' fails without it.
+    """
+    choice = os.environ.get(BACKEND_VARIABLE, 'auto') if backend is None else backend
+    if choice not in ('auto','python','rust'):
+        raise ValueError(f"execution backend must be 'auto', 'python' or 'rust', not {choice!r}")
+    if choice == 'rust' and _native_execute_batch_arrays is None:
+        raise RuntimeError('the gen_trade_native extension with execute_batch_arrays is not installed')
+    return 'rust' if choice != 'python' and _native_execute_batch_arrays is not None else 'python'
 
 
 @dataclass(frozen=True)
@@ -86,6 +114,18 @@ class MarketArrays:
                    times.as_unit('ns').asi8,known.as_unit('ns').asi8,times.hour.to_numpy(),
                    np.asarray(times.year*12+times.month-1-first),np.asarray(known.year*12+known.month-1-first),months,*rolls)
 
+    @cached_property
+    def native_inputs(self):
+        """Contiguous quote, clock and rollover rows for the Rust engine (built once)."""
+        quotes = np.ascontiguousarray(np.vstack((
+            self.bid_open,self.ask_open,self.bid_close,self.ask_close,
+            self.conversion_bid_open,self.conversion_ask_open,self.conversion_bid_close,self.conversion_ask_close,
+            self.split,self.dividend)),dtype=np.float64)
+        clock = np.ascontiguousarray(np.vstack((self.time_ns,self.known_ns,self.open_month)),dtype=np.int64)
+        rollover = None if self.rollover_long is None else np.ascontiguousarray(
+            np.vstack((self.rollover_long,self.rollover_short)),dtype=np.float64)
+        return quotes,clock,rollover
+
 
 @dataclass
 class MarketBatch:
@@ -113,13 +153,11 @@ class MarketBatch:
 
 
 def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,stop_loss=None,record=False,
-                  record_equity=False,record_exposure=False):
+                  record_equity=False,record_exposure=False,backend=None):
     """Vectorized costed execution. ``record`` keeps equity and Trade objects;
     ``record_equity`` keeps only the marked-to-market equity path and
     ``record_exposure`` the per-bar invested flags (extensions; results are
-    otherwise identical)."""
-    from .backtest import Trade
-    spec = config.instrument
+    otherwise identical). ``backend`` is described in ``execution_backend``."""
     signals=np.asarray(signals)
     if signals.ndim==1:
         signals=signals[:,None]
@@ -127,11 +165,51 @@ def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,sto
         raise ValueError('Execution needs an aligned n-by-strategy decision matrix')
     m=signals.shape[1]
     cash=np.full(m,config.initial_cash,dtype=float) if initial_cash is None else np.broadcast_to(initial_cash,(m,)).astype(float).copy()
-    initial=cash.copy()
     if not np.isfinite(cash).all() or (cash<0).any():
         raise ValueError('Initial sleeve capital must be finite and nonnegative')
     tp=np.full(m,np.nan if config.take_profit is None else config.take_profit) if take_profit is None else np.broadcast_to(take_profit,(m,))
     sl=np.full(m,np.nan if config.stop_loss is None else config.stop_loss) if stop_loss is None else np.broadcast_to(stop_loss,(m,))
+    engine=_native_execute_batch if execution_backend(backend)=='rust' else _python_execute_batch
+    return engine(market,signals,config,cash,tp,sl,record,record_equity,record_exposure)
+
+
+def _native_execute_batch(market,signals,config,cash,tp,sl,record,record_equity,record_exposure):
+    from .backtest import Trade
+    spec=config.instrument
+    quotes,clock,rollover=market.native_inputs
+    costs={'slip':config.slippage_bps/10000,'fee_rate':config.fee+spec.commission_bps/10000,
+           'minimum_commission':float(spec.minimum_commission),'commission_per_unit':float(spec.commission_per_unit),
+           'leverage':float(spec.leverage),'quantity_step':float(spec.quantity_step or 0.),
+           'financing_long':float(spec.financing_long),'financing_short':float(spec.financing_short),
+           'debit_interest_rate':float(spec.debit_interest_rate),
+           'maintenance_margin_fraction':float(spec.maintenance_margin_fraction),
+           'holding_ns':pd.Timedelta(days=config.max_holding_days).value if config.max_holding_days is not None else None,
+           'stock':spec.asset_class=='stock','allow_short':bool(spec.allow_short)}
+    allowed=None if config.entry_hours is None else np.isin(market.hours,list(config.entry_hours))
+    out=_native_execute_batch_arrays(
+        quotes,clock,len(market.months),int(market.close_month[-1]),
+        rollover if spec.asset_class=='fx' else None,allowed,np.ascontiguousarray(signals,dtype=np.int8),
+        cash,np.ascontiguousarray(tp,dtype=np.float64),np.ascontiguousarray(sl,dtype=np.float64),
+        costs,record,record_equity,record_exposure)
+    ledger=[]
+    if record:
+        for (column,entry,exit_index,final,reason),values in zip(out['trade_ints'].tolist(),out['trade_floats'].tolist()):
+            fill_in,fill_out,trade_return,quantity,exit_quantity,pnl,fees,financing,income,unit_profit,unit_cost=values
+            why=_REASONS[reason]
+            ledger.append((column,Trade(entry,exit_index,market.times[entry],market.known[-1] if final else market.times[exit_index],
+                fill_in,fill_out,trade_return,why=='sample_end',why,quantity=quantity,exit_quantity=exit_quantity,
+                cash_pnl=pnl,fees=fees,financing=financing,dividend_income=income,account_currency=spec.account_currency,
+                unit_net_profit=unit_profit,unit_entry_cost=unit_cost)))
+    return MarketBatch(out['equity'],out['terminal_equity'],out['trade_counts'],out['trade_return_sum'],
+                       out['trade_return_std'],out['paper_total_return'],out['monthly_returns'],out['monthly_counts'],
+                       ledger,out['fees'],out['financing'],out['dividends'],market.months,out['trade_log_growth'],out['held'])
+
+
+def _python_execute_batch(market,signals,config,cash,tp,sl,record,record_equity,record_exposure):
+    """The reference engine; the Rust engine must reproduce it exactly."""
+    from .backtest import Trade
+    spec = config.instrument
+    m=signals.shape[1]
     quantity=np.zeros(m); entry_fill=np.zeros(m); entry_notional=np.zeros(m); entry_capital=np.ones(m)
     original_quantity=np.ones(m); original_fill=np.zeros(m); principal_flow=np.zeros(m)
     entry_index=np.zeros(m,dtype=int); entry_time=np.zeros(m,dtype=np.int64)
@@ -284,9 +362,14 @@ def execute_batch(market,signals,config,*,initial_cash=None,take_profit=None,sto
                        total_fees,total_carry,total_dividends,market.months,log_growth,held_path)
 
 
-def run_market_backtest(bars,signals,config):
+def run_market_backtest(bars,signals,config,*,market=None):
+    """One costed strategy. ``market`` reuses ``MarketArrays.from_bars(bars, config.instrument)``
+    already prepared by the caller (e.g. for every sleeve of one portfolio)."""
     from .backtest import BacktestResult
-    market=MarketArrays.from_bars(bars,config.instrument)
+    if market is None:
+        market=MarketArrays.from_bars(bars,config.instrument)
+    elif len(market.times)!=len(bars):
+        raise ValueError('Prepared market arrays must come from the same bars')
     outcome=execute_batch(market,np.asarray(signals),config,record=True)
     trades=tuple(t for column,t in outcome.trades if column==0)
     return BacktestResult(outcome.equity[:,0],np.array([t.return_fraction for t in trades]),trades,config,market.known,

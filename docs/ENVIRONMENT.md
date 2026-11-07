@@ -16,7 +16,7 @@ GeneTrader checkout.
 | Columnar data | Polars, PyArrow, DuckDB, pinned in `uv.lock` | Arrow conversion, Parquet round-trip and DuckDB query |
 | Daily market data | `market-data` extra: exchange_calendars and Matplotlib, locked in `uv.lock` | Strict NYSE session validation, raw source hashes, real equity/FX preflights and rendered equity reports |
 | Rust | `rust-toolchain.toml`: 1.90.0, minimal + rustfmt/clippy | Compiler version and locked release builds |
-| Python/Rust interface | `native/Cargo.lock`, PyO3 0.26 | DC numerical/reference parity |
+| Python/Rust interface | `native/Cargo.lock`, PyO3 0.26, rust-numpy 0.26 | Exact DC and trade-execution parity with the Python references |
 | Rayon integration | `environment/native-probe/Cargo.lock`, Rayon 1.11 / PyO3 0.26 | Python-callable parallel numerical probe compared to NumPy |
 | PostgreSQL | Official PostgreSQL 17 image pinned by digest in `compose.yaml` | Healthcheck and transactional write/read/rollback |
 | Redis | Official Redis 7.4 image pinned by digest in `compose.yaml` | Healthcheck and cache write/read/TTL/delete |
@@ -25,7 +25,8 @@ The Rayon probe is an environment check, not a claim that the trading engine's
 sequential DC state machine is parallelized. The experiment runner uses spawned
 processes for method/fold/seed jobs; ring islands can alternatively run in parallel.
 Each process worker caps native numerical threads at one using `threadpoolctl`.
-Native DC acceleration and fit-local memoization remain available. JupyterLab is
+The optional Rust module runs the trade simulator (most of every fit) and DC
+extraction; fit-local memoization remains available. JupyterLab is
 installed as a tool; setup does not start a notebook server or a live trading bot.
 
 ## Prerequisites and setup
@@ -51,7 +52,7 @@ bash scripts/doctor.sh
 | `--core` | numerical stack, tests, storage clients | `verify.py --core` |
 | `--market-data` | core + exchange calendars and plotting | `verify.py --core` |
 | `--full` | every research extra, Rust 1.90.0, both native wheels | `verify.py` (complete) |
-| `--native` (with core/market-data) | the Rust DC backend wheel | `verify.py --core` adds a Python/Rust parity check |
+| `--native` (with core/market-data) | the Rust backend wheel (trade execution and DC) | `verify.py --core` adds Python/Rust parity checks |
 
 Setup is idempotent and safe to rerun to repair an environment:
 
@@ -97,7 +98,7 @@ The doctor reads state and changes nothing. It runs with the project interpreter
 or any Python 3.9+, so it also diagnoses a missing or broken `.venv`. It reports
 uv, the venv's Python against `.python-version`, the recorded setup profile,
 whether `.venv` still matches `uv.lock` (offline dry run), installed extras, the
-`gen-trade` package and command, the DC backend, the pinned Rust toolchain,
+`gen-trade` package and command, the native backend, the pinned Rust toolchain,
 Docker and service ports, downloaded datasets, running or stopped benchmarks,
 shell activation, CPUs and free disk. Each problem prints its fix. It exits 1
 only when the core environment is unusable.

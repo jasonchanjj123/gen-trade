@@ -155,3 +155,42 @@ def test_reverse_split_preserves_position_value_and_original_trade_units():
     result=run_backtest(f,[1,0,-1,0],config)
     assert result.trades[0].quantity==100 and result.trades[0].exit_quantity==5
     assert result.equity[-1]==1100 and result.trades[0].cash_pnl==100
+
+
+def test_portfolio_prepares_market_arrays_once_and_matches_separate_sleeves(monkeypatch):
+    rng=np.random.default_rng(8)
+    f=bars(100*np.exp(np.cumsum(rng.normal(0,.02,60))));f.loc[20,'split_ratio']=2.;f.loc[35,'dividend']=.5
+    spec=InstrumentSpec('TEST','stock',quantity_step=1,minimum_commission=1,allow_short=True,financing_short=.03)
+    config=ExecutionConfig(initial_cash=10000,fee=.001,slippage_bps=2,instrument=spec)
+    plan=PortfolioSignals(('a','b','c','d'),rng.choice([-1,0,1],size=(60,4)),(.3,.2,0.,.4),cash_weight=.1,
+                          take_profit=.05,stop_loss=.03)
+    import gen_trade.market_execution as execution
+    builds=[]
+    prepare=execution.MarketArrays.from_bars.__func__
+    monkeypatch.setattr(execution.MarketArrays,'from_bars',classmethod(lambda cls,*args:builds.append(1) or prepare(cls,*args)))
+    result=run_portfolio_backtest(f,plan,config)
+    monkeypatch.undo()
+    assert len(builds)==1
+    # Reference: every sleeve runs its own backtest from the bars.
+    sleeve_config=replace(config,take_profit=.05,stop_loss=.03)
+    expected=np.full(61,10000*.1);trades=[];totals={'commissions':0.,'financing':0.,'dividends':0.}
+    for i,(name,weight) in enumerate(zip(plan.names,plan.weights)):
+        if weight==0:
+            continue
+        sleeve=run_backtest(f,plan.signals[:,i],replace(sleeve_config,initial_cash=10000*weight))
+        expected+=sleeve.equity
+        for key in totals:
+            totals[key]+=sleeve.ledger[key]
+        trades.extend(replace(t,strategy_id=name,allocation_fraction=weight) for t in sleeve.trades)
+    trades.sort(key=lambda t:(t.exit_time,t.strategy_id,t.entry_time))
+    np.testing.assert_array_equal(result.equity,expected)
+    assert list(result.trades)==trades and len(trades)>5
+    assert {key:result.ledger[key] for key in totals}==totals
+
+
+def test_prepared_market_must_match_the_bars():
+    from gen_trade.market_execution import run_market_backtest
+    f=bars([100,101,102,103])
+    config=ExecutionConfig(instrument=InstrumentSpec('TEST','stock'))
+    with pytest.raises(ValueError,match='same bars'):
+        run_market_backtest(f,[1,0,0,0],config,market=MarketArrays.from_bars(f.iloc[:3],config.instrument))

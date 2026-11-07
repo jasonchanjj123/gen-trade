@@ -84,11 +84,16 @@ def verify_core_computation() -> dict:
     checks = ["Parquet round-trip", "three spawned-process framework fits and next-open backtests",
               "finite net equity statistics", "stationary bootstrap/HAC", "all three paired comparisons"]
     from gen_trade import dc
+    from gen_trade.market_execution import execution_backend
     backend = "rust" if dc._native_dc_arrays is not None else "python (Rust backend not installed)"
     if dc._native_dc_arrays is not None:
         verify_dc_parity()
         checks.append("Python/Rust DC parity")
+    if execution_backend("auto") == "rust":
+        verify_execution_parity()
+        checks.append("Python/Rust execution parity")
     return {"data":"synthetic dependency checks only", "methods":list(methods), "dc_backend":backend,
+            "execution_backend":execution_backend(),
             "worker_processes":len({m["worker_pid"] for m in methods.values()}), "checks":checks}
 
 
@@ -104,6 +109,40 @@ def verify_dc_parity() -> None:
             if field.name != "threshold":
                 np.testing.assert_array_equal(getattr(python_profile, field.name),
                                               getattr(rust_profile, field.name))
+
+
+def verify_execution_parity() -> None:
+    """The Rust execution engine must reproduce the Python reference exactly."""
+    import numpy as np
+    import pandas as pd
+    from gen_trade.backtest import ExecutionConfig
+    from gen_trade.instruments import benchmark_spec
+    from gen_trade.market_execution import MarketArrays, MarketBatch, execute_batch
+
+    rng = np.random.default_rng(42)
+    n = 400
+    opens = pd.date_range("2020-01-02", periods=n, freq="B", tz="UTC")
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, n)))
+    open_ = np.concatenate(([100.0], close[:-1]))
+    frame = pd.DataFrame({"timestamp":opens, "available_at":opens + pd.Timedelta(hours=7), "open":open_,
+                          "high":np.maximum(open_, close) * 1.01, "low":np.minimum(open_, close) * 0.99,
+                          "close":close, "volume":1000.0, "split_ratio":1.0, "dividend":0.0})
+    frame.loc[150, "split_ratio"], frame.loc[60::63, "dividend"] = 2.0, 0.5
+    for name in ("open", "high", "low", "close"):
+        frame[f"bid_{name}"], frame[f"ask_{name}"] = frame[name] / 100 * 0.9999, frame[name] / 100 * 1.0001
+    signals = rng.choice([-1, 0, 1], size=(n, 32), p=[0.1, 0.8, 0.1])
+    for symbol, data in (("AAPL", frame), ("EUR/USD", frame.drop(columns=["split_ratio", "dividend"]))):
+        spec = benchmark_spec(symbol, stress=True)
+        config = ExecutionConfig(initial_cash=100_000, fee=0.0, slippage_bps=1.0, take_profit=0.05,
+                                 stop_loss=0.03, max_holding_days=30, instrument=spec)
+        market = MarketArrays.from_bars(data, spec)
+        ours, reference = (execute_batch(market, signals, config, record=True, record_exposure=True, backend=engine)
+                           for engine in ("rust", "python"))
+        require(ours.trades == reference.trades, f"{symbol}: Rust and Python trade ledgers differ")
+        for field in fields(MarketBatch):
+            if field.name not in ("trades", "months"):
+                np.testing.assert_array_equal(getattr(ours, field.name), getattr(reference, field.name),
+                                              err_msg=f"{symbol}: {field.name}", strict=True)
 
 
 def verify_computation() -> dict:
@@ -141,6 +180,7 @@ def verify_computation() -> dict:
     require(bool(np.isclose(gen_trade_env_native.sum_squares(values.tolist()), expected, rtol=1e-12)),
             "PyO3/Rayon numerical check failed")
     verify_dc_parity()
+    verify_execution_parity()
 
     bootstrap = StationaryBootstrap(8, values, seed=42)
     interval = bootstrap.conf_int(np.mean, reps=100, method="percentile")
@@ -151,7 +191,7 @@ def verify_computation() -> dict:
     return {
         "data": "synthetic dependency checks only",
         "rows": len(values),
-        "checks": ["Polars/Arrow/Parquet/DuckDB", "Numba JIT", "Python/Rust DC parity",
+        "checks": ["Polars/Arrow/Parquet/DuckDB", "Numba JIT", "Python/Rust DC parity", "Python/Rust execution parity",
                    "PyO3/Rayon numerical parity", "stationary bootstrap", "HAC", "SciPy"],
     }
 

@@ -167,8 +167,9 @@ scenario rather than unavailable historical broker swaps. See
 The user's OHLCV/gold/FX terminals are optional MOO3 extensions with causal joins.
 Pair and UTC entry-time choices are stored as experiment context, not falsely
 described as original evolved genes. Jointly evolving those choices for both
-methods is unfinished. The optional Rust kernel accelerates DC extraction and is
-checked against the Python reference, including every causal prefix.
+methods is unfinished. The optional Rust module accelerates DC extraction and
+trade execution; both are checked against their Python references (DC including
+every causal prefix) and give identical results.
 
 Tests cover the source equations, operators, training-only calibration/selection,
 prefix invariance, future-data perturbations, warm-up, clock-unit equivalence,

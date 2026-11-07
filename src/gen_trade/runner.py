@@ -303,6 +303,7 @@ def compare_methods(
         source_hash.update(str(path.relative_to(root)).encode())
         source_hash.update(path.read_bytes())
     from . import dc
+    from .market_execution import execution_backend
     native_hash = None
     if dc._native_dc_arrays is not None:
         import gen_trade_native
@@ -317,6 +318,7 @@ def compare_methods(
         "source_and_lock_sha256":source_hash.hexdigest(),
         "runtime":{"python":platform.python_version(),"platform":platform.platform(),
                    "dc_backend":"rust" if dc._native_dc_arrays is not None else "python",
+                   "execution_backend":execution_backend(),
                    "native_binary_sha256":native_hash,
                    "packages":{name:version(name) for name in ("numpy","pandas","scipy","statsmodels","arch","TA-Lib")}},
         "data_kind":"synthetic test fixture" if synthetic else "user supplied; not independently audited",

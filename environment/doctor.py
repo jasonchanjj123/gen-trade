@@ -123,8 +123,8 @@ def check_extras(state):
 def check_package(state):
     if not state.get("venv_ok"):
         return INFO, "skipped (no working .venv)", None
-    probe = ("import gen_trade, json; from gen_trade import dc; "
-             "print(json.dumps({'version':gen_trade.__version__,'native':dc._native_dc_arrays is not None,"
+    probe = ("import gen_trade, json; from gen_trade import market_execution as e; "
+             "print(json.dumps({'version':gen_trade.__version__,'native':e._native_execute_batch_arrays is not None,"
              "'path':gen_trade.__file__}))")
     code, text = run([str(VENV_PYTHON), "-c", probe], cwd="/")
     if code != 0:
@@ -146,7 +146,7 @@ def check_backend(state):
         return INFO, "unknown", None
     if state["native"]:
         return OK, "Rust (gen_trade_native); identical results to the Python fallback", None
-    return INFO, "Python fallback (correct, slightly slower)", \
+    return INFO, "Python fallback (identical results, benchmarks run about 5-10x slower)", \
         "Optional: bash scripts/setup-environment.sh --native"
 
 
@@ -265,7 +265,7 @@ def check_machine(state):
 
 CHECKS = [("uv", check_uv), ("Python venv", check_venv), ("Setup profile", check_setup_record),
           ("Locked packages", check_lock), ("Extras", check_extras), ("gen-trade", check_package),
-          ("DC backend", check_backend), ("Rust", check_rust), ("Docker", check_docker),
+          ("Native backend", check_backend), ("Rust", check_rust), ("Docker", check_docker),
           ("Data", check_data), ("Runs", check_runs), ("Shell", check_shell), ("Machine", check_machine)]
 
 

@@ -25,7 +25,7 @@ The recommended experiment environment is Python 3.12.13 with
 NumPy/pandas/SciPy/TA-Lib and spawned process workers:
 
 ```bash
-bash scripts/setup-environment.sh --core     # add --native for the Rust DC backend
+bash scripts/setup-environment.sh --core     # add --native for the Rust backend (about 5-10x faster runs)
 source scripts/activate.sh                   # bash or zsh
 bash scripts/doctor.sh                       # what is installed, what is missing, how to fix it
 gen-trade demo --workers 3 --cross-market-features --output reports/three-method-comparison.json
@@ -75,9 +75,18 @@ uv pip install --python .venv/bin/python --no-deps dist/gen_trade_native-*.whl
 `uv sync` removes packages not declared in the project, including a manually
 installed native wheel. Reinstall that wheel after syncing when the Rust backend
 is wanted. Python fallback always remains available. `scripts/setup-environment.sh
---native` handles this order (and reuses an existing rustup). Native and Python DC
-outputs are checked for parity; the measured gain is modest (about 1.4× on the DC
-step on an M-series Mac, `python scripts/benchmark_dc.py`).
+--native` handles this order (and reuses an existing rustup).
+
+The Rust module runs the trade simulator (`execute_batch`), which is about 90% of a
+benchmark's work in Python, and DC extraction. Its results are identical to the
+Python reference: `tests/test_native_execution.py`, `tests/test_dc.py` and
+`environment/verify.py` compare them exactly. On an M4 Mac, one asset/year/seed of
+`--protocol audited2 --method-profile robust_monthly` took 4.7 s instead of 46 s,
+and four assets × two years × two seeds with `--workers 8` took 30 s instead of
+179 s, with identical reports. `python scripts/benchmark_execution.py` times single
+calls; `python scripts/benchmark_dc.py` times DC, where the gain is small (about
+1.4×). Set `GEN_TRADE_EXECUTION_BACKEND=python` to run the Python reference;
+reports record the engine as `runtime.execution_backend`.
 
 ## Supply real data
 

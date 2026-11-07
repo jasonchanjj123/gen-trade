@@ -146,11 +146,17 @@ def run_portfolio_backtest(
     equity = np.full(len(frame) + 1, config.initial_cash * plan.cash_weight)
     trades = []
     ledger_totals = {"commissions":0.,"financing":0.,"dividends":0.}
+    market = None
+    if config.instrument is not None:
+        # Every sleeve trades the same bars, so prepare the execution arrays once.
+        from .market_execution import MarketArrays, run_market_backtest
+        market = MarketArrays.from_bars(frame, config.instrument)
     for i, (name, weight) in enumerate(zip(plan.names, plan.weights)):
         if weight == 0:
             continue
         sleeve_config = replace(config,initial_cash=config.initial_cash*weight) if config.instrument is not None else config
-        sleeve = run_backtest(frame, plan.signals[:, i], sleeve_config)
+        sleeve = (run_market_backtest(frame, plan.signals[:, i], sleeve_config, market=market) if market is not None
+                  else run_backtest(frame, plan.signals[:, i], sleeve_config))
         equity += sleeve.equity if config.instrument is not None else weight * sleeve.equity
         if sleeve.ledger:
             for key in ledger_totals:

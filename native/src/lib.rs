@@ -1,4 +1,7 @@
-//! Causal directional-change extraction; matches the Python reference exactly.
+//! Causal directional-change extraction and batched trade execution; both
+//! match their Python references exactly.
+mod execution;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -115,5 +118,6 @@ fn dc_arrays(py: Python<'_>, prices: Vec<f64>, threshold: f64) -> PyResult<DCCol
 #[pymodule]
 fn gen_trade_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dc_arrays, m)?)?;
+    m.add_function(wrap_pyfunction!(execution::execute_batch_arrays, m)?)?;
     Ok(())
 }
