@@ -197,7 +197,9 @@ figure was inspected.
   HAC tests (six assets × three seeds × three method pairs), with Holm adjustment.
 - `report.md` and `equity.png`: median outcomes and the range of held-out equity
   across all declared seeds, alongside costed next-open buy-and-hold.
-- `progress.json`: completed asset checkpoints and elapsed time.
+- `progress.json` and `progress.log`: live run state (jobs done/total, ETA, current
+  asset, recent jobs, final status) and a line per event; `gen-trade status` reads
+  them. They are monitoring files, not results, and take no part in verification.
 - `verification.json`: completed by the verification command after checking
   current source/data fingerprints, every declared seed/year/method, chronological
   boundaries, held-out timestamps and cash/cost ledger conservation.

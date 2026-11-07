@@ -15,6 +15,7 @@ from .data import ChromosomeContext
 from .experiments import METHOD_NAMES,CANDIDATE_PROFILES
 from .instruments import benchmark_spec
 from .market_data import load_dataset, merge_fx_weekend_stubs
+from .progress import ProgressTracker
 from .runner import Fold,compare_methods
 from .statistics import (deflated_sharpe_ratio,detailed_statistics,excess_over_blend,holm_adjust,paired_comparison,
                          pbo_cscv,probabilistic_sharpe_ratio,rademacher_antiserum,spa_excess,spa_test,stepm_excess)
@@ -614,7 +615,8 @@ def _render_report(directory,summary,paths):
 def run_benchmark(data_directory,output_directory,*,population_size=64,generations=20,seeds=(11,22,33),workers=3,
                   first_test_year=2019,last_test_year=2025,embargo_bars=5,bootstrap_reps=500,resume=True,
                   symbols=None,method_profile='paper',protocol='original',random_timing_reps=200,pbo_blocks=8,
-                  spa_reps=1000,method_configs=None,lockbox=None,unlock_lockbox=False):
+                  spa_reps=1000,method_configs=None,lockbox=None,unlock_lockbox=False,progress='auto'):
+    """``progress`` is a ProgressTracker or a mode (auto, bar, log, off); it never enters reports."""
     if method_configs is not None:
         method_profile='custom'
         if set(method_configs)!=set(METHOD_NAMES):
@@ -649,6 +651,29 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
     if lock and lock.get('lockbox_touched'):
         settings['lockbox']=lock
     directory=Path(output_directory);directory.mkdir(parents=True,exist_ok=True)
+    tracker=progress if isinstance(progress,ProgressTracker) else ProgressTracker(mode=progress)
+    jobs_per_asset=(last_test_year-first_test_year+1)*len(seeds)*len(METHOD_NAMES)*(2 if rules['compare'].get('selection')=='pooled' else 1)
+    for symbol in symbols:
+        tracker.plan(symbol,jobs_per_asset)
+    tracker.attach(directory,symbols)
+    try:
+        summary=_run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candidates,seeds,lock,lockbox_record,
+                            method_profile=method_profile,protocol=protocol,population_size=population_size,
+                            generations=generations,workers=workers,first_test_year=first_test_year,
+                            last_test_year=last_test_year,embargo_bars=embargo_bars,bootstrap_reps=bootstrap_reps,
+                            resume=resume,random_timing_reps=random_timing_reps,pbo_blocks=pbo_blocks,spa_reps=spa_reps)
+    except BaseException as error:
+        tracker.finish('interrupted' if isinstance(error,KeyboardInterrupt) else 'failed',
+                       error=f'{type(error).__name__}: {error}')
+        raise
+    tracker.finish('completed')
+    tracker.note(f'Completed benchmark: {summary["method_runs"]} method runs; report {directory/"report.md"}')
+    return summary
+
+
+def _run_assets(tracker,directory,symbols,markets,manifest,settings,rules,candidates,seeds,lock,lockbox_record,*,
+                method_profile,protocol,population_size,generations,workers,first_test_year,last_test_year,
+                embargo_bars,bootstrap_reps,resume,random_timing_reps,pbo_blocks,spa_reps):
     source_hash=_code_hash();reports={};start=perf_counter()
     for symbol in symbols:
         spec=benchmark_spec(symbol,fx_financing=rules['fx_financing'],stock_minimum_spread=rules['stock_minimum_spread'])
@@ -662,7 +687,8 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
             if cached.get('benchmark_signature')!=signature:
                 raise ValueError(f'{symbol}: existing report belongs to different code/data/settings; use a new output directory or no-resume')
             reports[symbol]=cached
-            print(f'Verified completed asset: {symbol}',flush=True)
+            tracker.resume(symbol)
+            tracker.note(f'Verified completed asset: {symbol}')
             continue
         frame=markets[symbol]
         periods_per_year=manifest['instruments'][symbol]['periods_per_year']
@@ -673,7 +699,7 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
             periods_per_year=float(len(frame)/span)
         run_markets={**markets,symbol:frame}
         folds=calendar_folds(frame,first_test_year=first_test_year,last_test_year=last_test_year,embargo_bars=embargo_bars)
-        print(f'Running {symbol}: {len(folds)} calendar folds × {len(seeds)} seeds × 3 methods',flush=True)
+        tracker.note(f'Running {symbol}: {len(folds)} calendar folds × {len(seeds)} seeds × 3 methods')
         report=compare_methods(run_markets,ChromosomeContext(symbol),train_bars=756,validation_bars=252,test_bars=252,
             embargo_bars=embargo_bars,max_folds=len(folds),population_size=population_size,generations=generations,
             seeds=tuple(seeds),fee=0,slippage_bps=1 if '/' not in symbol else .1,
@@ -681,7 +707,7 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
             workers=workers,instrument=spec,stress_instrument=stress_spec,
             initial_cash=100000,fold_plan=folds,include_paths=True,on_no_eligible='cash',
             method_configs={name:list(values) for name,values in candidates.items()},
-            random_timing_reps=random_timing_reps,**rules['compare'])
+            random_timing_reps=random_timing_reps,progress=tracker,**rules['compare'])
         report.update(benchmark_signature=signature,data_provenance=manifest['instruments'][symbol],
                       calendar_protocol={'training_years':3,'validation_years':1,'test_years':list(range(first_test_year,last_test_year+1))})
         if method_profile!='paper' or protocol!='original':
@@ -691,8 +717,9 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
             raise ValueError(f'{symbol}: report protocol block was overwritten')
         temporary=path.with_suffix('.json.tmp');temporary.write_text(json.dumps(report,allow_nan=False)+'\n');temporary.replace(path)
         reports[symbol]=report
-        (directory/'progress.json').write_text(json.dumps({'completed':list(reports),'requested':symbols,'elapsed_seconds':perf_counter()-start},indent=2)+'\n')
-        print(f'Finished {symbol}: {len(report["folds"])*3} method runs saved',flush=True)
+        tracker.asset_finished(symbol)
+        tracker.note(f'Finished {symbol}: {len(report["folds"])*3} method runs saved')
+    tracker.stage('summarizing: selection bias, SPA, pooled controls and report')
     records,pairs,paths=summarize(reports,manifest,settings)
     summary={'schema_version':2,'data_kind':'real historical market data','universe':symbols,'settings':settings,
              'source_sha256':source_hash,'elapsed_seconds':perf_counter()-start,'runs':records,'paired_comparisons':pairs,
@@ -709,7 +736,6 @@ def run_benchmark(data_directory,output_directory,*,population_size=64,generatio
                                                            settings=settings)
     (directory/'summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
     _render_report(directory,summary,paths)
-    print(f'Completed benchmark: {summary["method_runs"]} method runs; report {directory/"report.md"}',flush=True)
     return summary
 
 

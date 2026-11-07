@@ -25,12 +25,15 @@ The recommended experiment environment is Python 3.12.13 with
 NumPy/pandas/SciPy/TA-Lib and spawned process workers:
 
 ```bash
-bash scripts/setup-environment.sh --core
-source .venv/bin/activate
-python environment/verify.py --core
+bash scripts/setup-environment.sh --core     # add --native for the Rust DC backend
+source scripts/activate.sh                   # bash or zsh
+bash scripts/doctor.sh                       # what is installed, what is missing, how to fix it
 gen-trade demo --workers 3 --cross-market-features --output reports/three-method-comparison.json
 pytest -q
 ```
+
+Setup is safe to rerun: it reuses installed pieces, remembers the last profile,
+logs to `.tools/logs/`, and verifies before reporting success.
 
 The repository also offers the optional full research environment:
 Freqtrade/DEAP/Optuna, statistics and plotting tools, Polars/Arrow/DuckDB,
@@ -40,7 +43,7 @@ version pins, persistent storage, and verification details.
 
 ```bash
 cd gen-trade
-bash scripts/setup-environment.sh
+bash scripts/setup-environment.sh --full
 source scripts/activate.sh
 bash scripts/services.sh up -d --wait --wait-timeout 60
 python environment/verify.py --services
@@ -71,8 +74,10 @@ uv pip install --python .venv/bin/python --no-deps dist/gen_trade_native-*.whl
 
 `uv sync` removes packages not declared in the project, including a manually
 installed native wheel. Reinstall that wheel after syncing when the Rust backend
-is wanted. Python fallback always remains available. The prepared cloud install
-script handles this order. Native and Python DC outputs are checked for parity.
+is wanted. Python fallback always remains available. `scripts/setup-environment.sh
+--native` handles this order (and reuses an existing rustup). Native and Python DC
+outputs are checked for parity; the measured gain is modest (about 1.4× on the DC
+step on an M-series Mac, `python scripts/benchmark_dc.py`).
 
 ## Supply real data
 
@@ -84,12 +89,31 @@ trade/equity ledgers under primary and doubled-cost scenarios.
 
 ```bash
 bash scripts/setup-environment.sh --market-data
-source .venv/bin/activate
+source scripts/activate.sh
 gen-trade fetch-data --directory data/stocks-fx-2015-2025
 gen-trade benchmark --population 64 --generations 20 --seeds 11 22 33 \
   --workers 3 --output reports/stocks-fx-2015-2025
 python scripts/verify-benchmark.py reports/stocks-fx-2015-2025
 ```
+
+### Following a long run
+
+`benchmark`, `demo` and `compare` show live progress: a redrawn line on a terminal
+(jobs done, ETA, last finished fold/seed/method), or one line per finished job when
+output is redirected. `--progress off` keeps only the per-asset messages. A benchmark
+also keeps `progress.json` and `progress.log` in its output directory:
+
+```bash
+gen-trade status                                   # every run under reports/
+gen-trade status reports/stocks-fx-2015-2025 --watch   # refresh until it stops
+tail -f reports/stocks-fx-2015-2025/progress.log
+```
+
+A job is one method fit for one test year and seed (audited protocols count the
+validation and deployment phases separately). Status says `stopped` when the process
+disappeared without finishing; rerun the same command to resume, since finished
+assets are verified and reused. A sleeping Mac pauses the run: prefix long runs with
+`caffeinate -i` to keep it awake.
 
 See the [stock/FX protocol, costs and data limitations](docs/STOCKS_FX_BACKTEST.md).
 The benchmark runs six separate instrument accounts, long-only at 1× exposure;

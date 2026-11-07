@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shlex
 import sys
 
 from .data import ChromosomeContext, FeatureGene, read_market_data
+from .progress import MODES, ProgressTracker, show_status
 from .runner import compare_methods, synthetic_markets
 
 
@@ -49,6 +51,11 @@ def main(argv=None) -> int:
     freeze.add_argument('--hypotheses',type=Path,help='JSON list of pre-registered hypotheses (evaluated when the lockbox is unlocked)')
     freeze.add_argument('--universe',choices=('lockbox',),help='Use the rule-based lockbox universe for --symbols and record its rule')
     benchmark.add_argument('--random-timing-reps',type=int,default=200)
+    status=commands.add_parser('status',help='Show the progress of running or finished benchmarks')
+    status.add_argument('runs',nargs='*',type=Path,help='Benchmark output directories (default: every run under --root)')
+    status.add_argument('--root',type=Path,default=Path('reports'),help='Where to look for runs when none is named')
+    status.add_argument('--watch',type=float,nargs='?',const=5.,metavar='SECONDS',
+                        help='Refresh until the run stops (default every 5 seconds)')
     reanalyze=commands.add_parser('reanalyze',help='Recompute a finished benchmark summary with the current statistics')
     reanalyze.add_argument('source',type=Path,help='Finished benchmark directory (left unchanged)')
     reanalyze.add_argument('--output',type=Path,required=True,help='New directory for summary.json/report.md')
@@ -86,10 +93,17 @@ def main(argv=None) -> int:
         p.add_argument("--output",type=Path,default=Path("reports/comparison.json"))
         p.add_argument("--persist",action="store_true",help="Also save to PostgreSQL using DATABASE_URL")
         p.add_argument("--experiment-id",help="Required with --persist; immutable result ID")
+    for p in (benchmark, *(commands.choices[name] for name in ("demo", "compare"))):
+        p.add_argument('--progress',choices=MODES,default='auto',
+                       help='auto: live line on a terminal, one line per finished job otherwise; off: messages only')
+    argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(argv)
     if getattr(args,'persist',False) and not args.experiment_id:
         parser.error("--persist requires --experiment-id")
+    command_line = 'gen-trade ' + shlex.join(argv)
     try:
+        if args.command=='status':
+            return show_status(args.runs,watch=args.watch,root=args.root)
         if args.command=='fetch-data':
             from .market_data import fetch_dataset
             from .market_data import UNIVERSES
@@ -113,7 +127,8 @@ def main(argv=None) -> int:
                           resume=not args.no_resume,symbols=args.symbols,method_profile=args.method_profile,
                           protocol=args.protocol,random_timing_reps=args.random_timing_reps,
                           method_configs=json.loads(args.method_configs.read_text()) if args.method_configs else None,
-                          lockbox=args.lockbox,unlock_lockbox=args.unlock_lockbox)
+                          lockbox=args.lockbox,unlock_lockbox=args.unlock_lockbox,
+                          progress=ProgressTracker(mode=args.progress,command=command_line))
             return 0
         if args.command=='freeze-profiles':
             from .benchmark import freeze_profiles
@@ -130,15 +145,21 @@ def main(argv=None) -> int:
         markets = synthetic_markets(args.bars,args.seed) if args.command == "demo" else read_market_data(args.data)
         genes = tuple(FeatureGene(source,lag=1,max_age="4D") for source in ("XAU/USD","EUR/USD")) if args.cross_market_features else ()
         context = ChromosomeContext(args.pair,tuple(args.entry_hours) if args.entry_hours else None,genes)
-        report = compare_methods(markets,context,train_bars=args.train_bars,test_bars=args.test_bars,
-                                 validation_bars=args.validation_bars,workers=args.workers,island_workers=args.island_workers,
-                                 seeds=tuple(args.seeds) if args.seeds else None,
-                                 method_configs=json.loads(args.method_configs.read_text()) if args.method_configs else None,
-                                 embargo_bars=args.embargo_bars,max_folds=args.folds,
-                                 population_size=args.population,generations=args.generations,
-                                 seed=args.seed,fee=args.fee,slippage_bps=args.slippage_bps,
-                                 periods_per_year=args.periods_per_year,bootstrap_reps=args.bootstrap_reps,
-                                 synthetic=args.command == "demo")
+        method_configs = json.loads(args.method_configs.read_text()) if args.method_configs else None
+        tracker = ProgressTracker(mode=args.progress,command=command_line)
+        try:
+            report = compare_methods(markets,context,train_bars=args.train_bars,test_bars=args.test_bars,
+                                     validation_bars=args.validation_bars,workers=args.workers,island_workers=args.island_workers,
+                                     seeds=tuple(args.seeds) if args.seeds else None,method_configs=method_configs,
+                                     embargo_bars=args.embargo_bars,max_folds=args.folds,
+                                     population_size=args.population,generations=args.generations,
+                                     seed=args.seed,fee=args.fee,slippage_bps=args.slippage_bps,
+                                     periods_per_year=args.periods_per_year,bootstrap_reps=args.bootstrap_reps,
+                                     synthetic=args.command == "demo",progress=tracker)
+        except BaseException as error:
+            tracker.finish('interrupted' if isinstance(error,KeyboardInterrupt) else 'failed')
+            raise
+        tracker.finish('completed')
         text = json.dumps(report,indent=2,allow_nan=False)+"\n"
         args.output.parent.mkdir(parents=True,exist_ok=True)
         args.output.write_text(text)
@@ -150,6 +171,10 @@ def main(argv=None) -> int:
         if args.command == "demo":
             print("Synthetic data only; this is a software validation, not evidence of trading performance.")
         return 0
+    except KeyboardInterrupt:
+        print("Interrupted. A benchmark resumes from its finished assets when rerun with the same command.",
+              file=sys.stderr)
+        return 130
     except (ValueError,KeyError,RuntimeError,OSError,TypeError) as exc:
         print(f"Experiment failed: {exc}",file=sys.stderr)
         return 2

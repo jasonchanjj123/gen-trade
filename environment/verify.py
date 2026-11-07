@@ -81,10 +81,29 @@ def verify_core_computation() -> dict:
     require(set(methods) == {"moo3", "mstgam", "igtsp_ring"}, "Three-framework execution failed")
     require(all(np.isfinite(m["statistics"]["net_total_return"]) for m in methods.values()),
             "Nonfinite held-out statistics")
-    return {"data":"synthetic dependency checks only", "methods":list(methods),
-            "worker_processes":len({m["worker_pid"] for m in methods.values()}),
-            "checks":["Parquet round-trip", "three spawned-process framework fits and next-open backtests",
-                      "finite net equity statistics", "stationary bootstrap/HAC", "all three paired comparisons"]}
+    checks = ["Parquet round-trip", "three spawned-process framework fits and next-open backtests",
+              "finite net equity statistics", "stationary bootstrap/HAC", "all three paired comparisons"]
+    from gen_trade import dc
+    backend = "rust" if dc._native_dc_arrays is not None else "python (Rust backend not installed)"
+    if dc._native_dc_arrays is not None:
+        verify_dc_parity()
+        checks.append("Python/Rust DC parity")
+    return {"data":"synthetic dependency checks only", "methods":list(methods), "dc_backend":backend,
+            "worker_processes":len({m["worker_pid"] for m in methods.values()}), "checks":checks}
+
+
+def verify_dc_parity() -> None:
+    import numpy as np
+    from gen_trade.dc import DCProfile, directional_changes
+
+    prices = np.exp(np.cumsum(np.random.default_rng(42).normal(0, 0.01, 512)))
+    for threshold in (0.005, 0.01, 0.02):
+        python_profile = directional_changes(prices, threshold, backend="python")
+        rust_profile = directional_changes(prices, threshold, backend="rust")
+        for field in fields(DCProfile):
+            if field.name != "threshold":
+                np.testing.assert_array_equal(getattr(python_profile, field.name),
+                                              getattr(rust_profile, field.name))
 
 
 def verify_computation() -> dict:
@@ -96,7 +115,6 @@ def verify_computation() -> dict:
     import scipy.stats as stats
     import statsmodels.api as sm
     from arch.bootstrap import StationaryBootstrap
-    from gen_trade.dc import DCProfile, directional_changes
 
     rng = np.random.default_rng(42)
     values = rng.normal(0, 0.01, 128)
@@ -122,13 +140,7 @@ def verify_computation() -> dict:
     require(bool(np.isclose(sum_squares(values), expected, rtol=1e-12)), "Numba JIT failed")
     require(bool(np.isclose(gen_trade_env_native.sum_squares(values.tolist()), expected, rtol=1e-12)),
             "PyO3/Rayon numerical check failed")
-    prices = np.exp(np.cumsum(values))
-    python_profile = directional_changes(prices, 0.01, backend="python")
-    rust_profile = directional_changes(prices, 0.01, backend="rust")
-    for field in fields(DCProfile):
-        if field.name != "threshold":
-            np.testing.assert_array_equal(getattr(python_profile, field.name),
-                                          getattr(rust_profile, field.name))
+    verify_dc_parity()
 
     bootstrap = StationaryBootstrap(8, values, seed=42)
     interval = bootstrap.conf_int(np.mean, reps=100, method="percentile")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from functools import partial
 import hashlib
 from importlib.metadata import version
 from itertools import combinations
@@ -19,6 +20,7 @@ from .experiments import (DEPLOY_POLICIES, METHOD_NAMES, VALIDATION_METRICS, Exp
                           finish_experiment, finish_or_cash, pooled_choice, run_experiment, run_experiment_or_cash,
                           run_trials)
 from .parallel import process_pool
+from .progress import job_callback, timed_call
 from .instruments import InstrumentSpec
 from .methods.cadence import decision_bars
 from .statistics import (alpha_beta, detailed_statistics, exposure_matched_blend, exposure_path, holm_adjust,
@@ -225,12 +227,15 @@ def compare_methods(
     selection: str = "per_seed", deploy: str = "refit", min_validation_trades: int = 1,
     validation_curves: bool = False, exposure_controls_enabled: bool = False, random_timing_reps: int = 200,
     validation_metric: str = "log_wealth_minus_drawdown",
+    progress=None,
 ) -> dict:
     """Compare documented adaptations; common costs/settings, frozen training fits.
 
     Fresh cash/positions per fold. Indicators see past training/embargo observations
     as warm-up, but the training scaler/calibration/selection never sees test rows.
     Neither folds nor seeds are ranked to pick a winner from held-out returns.
+    ``progress`` (a ``ProgressTracker``) only observes job completions; it does
+    not enter the report.
     """
     for name, value, lower in (("population_size", population_size, 4), ("generations", generations, 0),
                                ("seed", seed, 0), ("workers", workers, 1), ("island_workers", island_workers, 1)):
@@ -350,32 +355,52 @@ def compare_methods(
                                     if stress_instrument else None, deploy, min_validation_trades, validation_curves,
                                     validation_metric)
                 pending.append((record_index, name, job))
-    pool = process_pool(min(workers, len(pending))) if workers > 1 else None
     run_job=run_experiment_or_cash if on_no_eligible=='cash' else run_experiment
     results_by_record = [{} for _ in records]
     pooled = selection == "pooled" and validation_bars > 0
+    if progress is not None:
+        progress.begin(context.pair, len(pending) * (2 if pooled else 1))
+    pool = process_pool(min(workers, len(pending))) if workers > 1 else None
 
-    def call(function, *args):
-        return pool.submit(function, *args) if pool else function(*args)
+    def describe(index, name, phase=None):
+        fold_report = records[index][0]
+        return {"asset":context.pair, "fold":fold_report["index"] + 1, "folds":len(folds),
+                "test_start":fold_report["test_first_open"][:10], "seed":fold_report["base_seed"],
+                "method":name, "phase":phase}
+
+    def call(function, *args, label=None):
+        # Results are still awaited in submission order below; progress only
+        # observes completions, so reports do not depend on finishing order.
+        if pool:
+            future = pool.submit(timed_call, function, *args)
+            if progress is not None:
+                future.add_done_callback(partial(job_callback, progress, label))
+            return future
+        seconds, result = timed_call(function, *args)
+        if progress is not None:
+            progress.job_done(label, seconds)
+        return result
 
     def value(task):
-        return task.result() if pool else task
+        return task.result()[1] if pool else task
 
     try:
         if pooled:
             # EXTENSION phase 1: training fits and validation scores for every seed.
-            trial_tasks = [(index, name, job, call(run_trials, job)) for index, name, job in pending]
+            trial_tasks = [(index, name, job, call(run_trials, job, label=describe(index, name, "validate")))
+                           for index, name, job in pending]
             trial_sets = [(index, name, job, value(task)) for index, name, job, task in trial_tasks]
             groups = {}
             for index, name, job, trials in trial_sets:
                 groups.setdefault((records[index][0]["index"], name), []).append(trials)
             choices = {key:pooled_choice(sets) for key, sets in groups.items()}
             finisher = finish_or_cash if on_no_eligible == 'cash' else finish_experiment
-            tasks = [(index, name, call(finisher, job, trials, *choices[(records[index][0]["index"], name)]))
+            tasks = [(index, name, call(finisher, job, trials, *choices[(records[index][0]["index"], name)],
+                                        label=describe(index, name, "deploy")))
                      for index, name, job, trials in trial_sets]
         else:
             # Submit all independent method/fold/seed jobs before awaiting results.
-            tasks = [(index, name, call(run_job, job)) for index, name, job in pending]
+            tasks = [(index, name, call(run_job, job, label=describe(index, name))) for index, name, job in pending]
         for index, name, task in tasks:
             method_report, result = value(task)
             fold_report, _, _, fold_seed = records[index]
@@ -395,6 +420,8 @@ def compare_methods(
     finally:
         if pool:
             pool.shutdown(wait=True, cancel_futures=True)
+    if progress is not None:
+        progress.stage(f"{context.pair}: paired tests, baselines and controls")
     for (fold_report, test, _, fold_seed), results in zip(records, results_by_record):
         pairs = {}
         for first, second in combinations(METHOD_NAMES, 2):
